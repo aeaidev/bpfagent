@@ -1,6 +1,12 @@
-use aya::programs::TracePoint;
-#[rustfmt::skip]
-use log::{debug, warn};
+use std::time::Duration;
+
+use aya::{
+    maps::{HashMap, MapData},
+    programs::TracePoint,
+};
+use aya_log::EbpfLogger;
+use kfree_skb_common::{SkbDropReason, reason_name};
+use log::{debug, info, warn};
 use tokio::signal;
 
 #[tokio::main]
@@ -26,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         env!("OUT_DIR"),
         "/kfree_skb"
     )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
+    match EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
             warn!("failed to initialize eBPF logger: {e}");
@@ -47,10 +53,60 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach("skb", "kfree_skb")?;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    // Get the DROP_COUNTS map
+    let mut drop_counts =
+        HashMap::<&mut MapData, u32, u64>::try_from(ebpf.map_mut("DROP_COUNTS").unwrap())?;
+
+    println!("Waiting for Ctrl-C... (drops will be displayed periodically)");
+
+    // Display drops every second until Ctrl-C
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("\nExiting...");
+                break;
+            }
+            _ = interval.tick() => {
+                // Fetch and display current counts
+                display_drop_counts(&mut drop_counts)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn display_drop_counts(drop_counts: &mut HashMap<&mut MapData, u32, u64>) -> anyhow::Result<()> {
+    // Read all entries from the map
+    let mut all_counts = Vec::new();
+    for reason in 0..131 {
+        match drop_counts.get(&reason, 0) {
+            Ok(count) => {
+                let reason_name = reason_name(SkbDropReason::from(reason));
+                all_counts.push((reason, reason_name, count));
+            }
+            Err(e) => {
+                warn!("Error reading count for reason {}: {}", reason, e);
+            }
+        }
+    }
+
+    // Sort by count (descending)
+    all_counts.sort_by(|a, b| b.1.cmp(a.1));
+
+    if all_counts.is_empty() {
+        info!("No drops recorded yet");
+    } else {
+        info!(
+            "Drop counts (total: {}):",
+            all_counts.iter().map(|(_, _, c)| *c).sum::<u64>()
+        );
+        for (reason, name, count) in &all_counts {
+            info!("  {:3} ({:30}): {}", reason, name, count);
+        }
+    }
 
     Ok(())
 }
