@@ -1,0 +1,17 @@
+[package]
+name = "kfree_skb-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kfree_skb-common = { path = "../kfree_skb-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "kfree_skb"
+path = "src/main.rs"
