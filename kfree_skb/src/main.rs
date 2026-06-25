@@ -6,7 +6,7 @@ use aya::{
 };
 use aya_log::EbpfLogger;
 use kfree_skb_common::{SkbDropReason, reason_name};
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use tokio::signal;
 
 #[tokio::main]
@@ -79,22 +79,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn display_drop_counts(drop_counts: &mut HashMap<&mut MapData, u32, u64>) -> anyhow::Result<()> {
-    // Read all entries from the map
+    // Collect all entries from the map
     let mut all_counts = Vec::new();
-    for reason in 0..131 {
-        match drop_counts.get(&reason, 0) {
-            Ok(count) => {
-                let reason_name = reason_name(SkbDropReason::from(reason));
-                all_counts.push((reason, reason_name, count));
-            }
-            Err(e) => {
-                trace!("Error reading count for reason {}: {}", reason, e);
-            }
-        }
+    for entry in drop_counts.iter() {
+        let (reason, count) = entry?;
+        let reason_name = reason_name(SkbDropReason::from(reason));
+        all_counts.push((reason, reason_name, count));
     }
 
     // Sort by count (descending)
-    all_counts.sort_by(|a, b| b.1.cmp(a.1));
+    all_counts.sort_by(|a, b| b.2.cmp(&a.2));
 
     if all_counts.is_empty() {
         info!("No drops recorded yet");
