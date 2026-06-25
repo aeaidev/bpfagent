@@ -143,132 +143,126 @@ pub enum SkbDropReason {
     QdiscOverlimit = 66,
     /// Qdisc congested
     QdiscCongested = 67,
-    /// Cake flood
-    CakeFlood = 68,
-    /// FQ band limit
-    FqBandLimit = 69,
-    /// FQ horizon limit
-    FqHorizonLimit = 70,
-    /// FQ flow limit
-    FqFlowLimit = 71,
-    /// CPU backlog
-    CpuBacklog = 72,
+    /// MACVLAN broadcast backlog
+    MacvlanBroadcastBacklog = 68,
+    /// IPvlan multicast backlog
+    IpvlanMulticastBacklog = 69,
     /// XDP
-    Xdp = 73,
+    Xdp = 70,
     /// TC ingress
-    TcIngress = 74,
+    TcIngress = 71,
     /// Unhandled protocol
-    UnhandledProto = 75,
+    UnhandledProto = 72,
     /// SKB checksum
-    SkbCsum = 76,
+    SkbCsum = 73,
     /// SKB GSO segment
-    SkbGsoSeg = 77,
+    SkbGsoSeg = 74,
     /// SKB bad GSO
-    SkbBadGso = 78,
+    SkbBadGso = 75,
     /// SKB ucopy fault
-    SkbUcopyFault = 79,
+    SkbUcopyFault = 76,
     /// Device header
-    DevHdr = 80,
+    DevHdr = 77,
     /// Device ready
-    DevReady = 81,
+    DevReady = 78,
     /// Full ring
-    FullRing = 82,
+    FullRing = 79,
     /// No memory
-    NoMem = 83,
+    NoMem = 80,
     /// Header truncate
-    HdrTrunc = 84,
+    HdrTrunc = 81,
     /// TAP filter
-    TapFilter = 85,
+    TapFilter = 82,
     /// TAP TX filter
-    TapTxFilter = 86,
+    TapTxFilter = 83,
     /// ICMP checksum
-    IcmpCsum = 87,
+    IcmpCsum = 84,
     /// Invalid protocol
-    InvalidProto = 88,
+    InvalidProto = 85,
     /// IP address errors
-    IpInaddrErrors = 89,
+    IpInaddrErrors = 86,
     /// IP no routes
-    IpInNoRoutes = 90,
+    IpInNoRoutes = 87,
     /// IP local source
-    IpLocalSource = 91,
+    IpLocalSource = 88,
     /// IP invalid source
-    IpInvalidSource = 92,
+    IpInvalidSource = 89,
     /// IP localnet
-    IpLocalnet = 93,
+    IpLocalnet = 90,
     /// IP invalid dest
-    IpInvalidDest = 94,
+    IpInvalidDest = 91,
     /// Packet too big
-    PktTooBig = 95,
+    PktTooBig = 92,
     /// Duplicate fragment
-    DupFrag = 96,
+    DupFrag = 93,
     /// Fragment reassembly timeout
-    FragReasmTimeout = 97,
+    FragReasmTimeout = 94,
     /// Fragment too far
-    FragTooFar = 98,
+    FragTooFar = 95,
     /// TCP minimum TTL
-    TcpMinTtl = 99,
+    TcpMinTtl = 96,
     /// IPv6 bad ext header
-    Ipv6BadExthdr = 100,
+    Ipv6BadExthdr = 97,
+    /// IPv6 too many ext hdrs
+    Ipv6TooManyExthdrs = 98,
     /// IPv6 NDISC frag
-    Ipv6NdiscFrag = 101,
+    Ipv6NdiscFrag = 99,
     /// IPv6 NDISC hop limit
-    Ipv6NdiscHopLimit = 102,
+    Ipv6NdiscHopLimit = 100,
     /// IPv6 NDISC bad code
-    Ipv6NdiscBadCode = 103,
+    Ipv6NdiscBadCode = 101,
     /// IPv6 NDISC bad options
-    Ipv6NdiscBadOptions = 104,
+    Ipv6NdiscBadOptions = 102,
     /// IPv6 NDISC NS otherhost
-    Ipv6NdiscNsOtherhost = 105,
+    Ipv6NdiscNsOtherhost = 103,
     /// Queue purge
-    QueuePurge = 106,
+    QueuePurge = 104,
     /// TC cookie error
-    TcCookieError = 107,
+    TcCookieError = 105,
     /// Packet socket error
-    PacketSocketError = 108,
+    PacketSocketError = 106,
     /// TC chain not found
-    TcChainNotFound = 109,
+    TcChainNotFound = 107,
     /// TC reclassify loop
-    TcReclassifyLoop = 110,
+    TcReclassifyLoop = 108,
     /// VXLAN invalid header
-    VxlanInvalidHdr = 111,
+    VxlanInvalidHdr = 109,
     /// VXLAN VNI not found
-    VxlanVniNotFound = 112,
+    VxlanVniNotFound = 110,
     /// MAC invalid source
-    MacInvalidSource = 113,
+    MacInvalidSource = 111,
     /// VXLAN entry exists
-    VxlanEntryExists = 114,
+    VxlanEntryExists = 112,
     /// No TX target
-    NoTxTarget = 115,
+    NoTxTarget = 113,
     /// IP tunnel ECN
-    IpTunnelEcn = 116,
+    IpTunnelEcn = 114,
     /// Tunnel TX info
-    TunnelTxinfo = 117,
+    TunnelTxinfo = 115,
     /// Local MAC
-    LocalMac = 118,
+    LocalMac = 116,
     /// ARP PVLAN disable
-    ArpPvlanDisable = 119,
+    ArpPvlanDisable = 117,
     /// MAC IEEE MAC control
-    MacIeeeMacControl = 120,
+    MacIeeeMacControl = 118,
     /// Bridge ingress STP state
-    BridgeIngressStpState = 121,
+    BridgeIngressStpState = 119,
     /// CAN RX invalid frame
-    CanRxInvalidFrame = 122,
+    CanRxInvalidFrame = 120,
     /// CAN FD RX invalid frame
-    CanfdRxInvalidFrame = 123,
+    CanfdRxInvalidFrame = 121,
     /// CAN XL RX invalid frame
-    CanxlRxInvalidFrame = 124,
+    CanxlRxInvalidFrame = 122,
     /// PFMEMALLOC
-    PmemAlloc = 125,
-    /// DualPI2 step drop
-    DualPi2StepDrop = 126,
+    PmemAlloc = 123,
     /// PSP input
-    PspInput = 127,
+    PspInput = 124,
     /// PSP output
-    PspOutput = 128,
+    PspOutput = 125,
     /// Recursion limit
-    RecursionLimit = 129,
+    RecursionLimit = 126,
     /// MAX
-    Max = 130,
+    Max = 127,
 }
 
 impl From<u32> for SkbDropReason {
@@ -342,69 +336,66 @@ impl From<u32> for SkbDropReason {
             65 => SkbDropReason::QdiscBurstDrop,
             66 => SkbDropReason::QdiscOverlimit,
             67 => SkbDropReason::QdiscCongested,
-            68 => SkbDropReason::CakeFlood,
-            69 => SkbDropReason::FqBandLimit,
-            70 => SkbDropReason::FqHorizonLimit,
-            71 => SkbDropReason::FqFlowLimit,
-            72 => SkbDropReason::CpuBacklog,
-            73 => SkbDropReason::Xdp,
-            74 => SkbDropReason::TcIngress,
-            75 => SkbDropReason::UnhandledProto,
-            76 => SkbDropReason::SkbCsum,
-            77 => SkbDropReason::SkbGsoSeg,
-            78 => SkbDropReason::SkbBadGso,
-            79 => SkbDropReason::SkbUcopyFault,
-            80 => SkbDropReason::DevHdr,
-            81 => SkbDropReason::DevReady,
-            82 => SkbDropReason::FullRing,
-            83 => SkbDropReason::NoMem,
-            84 => SkbDropReason::HdrTrunc,
-            85 => SkbDropReason::TapFilter,
-            86 => SkbDropReason::TapTxFilter,
-            87 => SkbDropReason::IcmpCsum,
-            88 => SkbDropReason::InvalidProto,
-            89 => SkbDropReason::IpInaddrErrors,
-            90 => SkbDropReason::IpInNoRoutes,
-            91 => SkbDropReason::IpLocalSource,
-            92 => SkbDropReason::IpInvalidSource,
-            93 => SkbDropReason::IpLocalnet,
-            94 => SkbDropReason::IpInvalidDest,
-            95 => SkbDropReason::PktTooBig,
-            96 => SkbDropReason::DupFrag,
-            97 => SkbDropReason::FragReasmTimeout,
-            98 => SkbDropReason::FragTooFar,
-            99 => SkbDropReason::TcpMinTtl,
-            100 => SkbDropReason::Ipv6BadExthdr,
-            101 => SkbDropReason::Ipv6NdiscFrag,
-            102 => SkbDropReason::Ipv6NdiscHopLimit,
-            103 => SkbDropReason::Ipv6NdiscBadCode,
-            104 => SkbDropReason::Ipv6NdiscBadOptions,
-            105 => SkbDropReason::Ipv6NdiscNsOtherhost,
-            106 => SkbDropReason::QueuePurge,
-            107 => SkbDropReason::TcCookieError,
-            108 => SkbDropReason::PacketSocketError,
-            109 => SkbDropReason::TcChainNotFound,
-            110 => SkbDropReason::TcReclassifyLoop,
-            111 => SkbDropReason::VxlanInvalidHdr,
-            112 => SkbDropReason::VxlanVniNotFound,
-            113 => SkbDropReason::MacInvalidSource,
-            114 => SkbDropReason::VxlanEntryExists,
-            115 => SkbDropReason::NoTxTarget,
-            116 => SkbDropReason::IpTunnelEcn,
-            117 => SkbDropReason::TunnelTxinfo,
-            118 => SkbDropReason::LocalMac,
-            119 => SkbDropReason::ArpPvlanDisable,
-            120 => SkbDropReason::MacIeeeMacControl,
-            121 => SkbDropReason::BridgeIngressStpState,
-            122 => SkbDropReason::CanRxInvalidFrame,
-            123 => SkbDropReason::CanfdRxInvalidFrame,
-            124 => SkbDropReason::CanxlRxInvalidFrame,
-            125 => SkbDropReason::PmemAlloc,
-            126 => SkbDropReason::DualPi2StepDrop,
-            127 => SkbDropReason::PspInput,
-            128 => SkbDropReason::PspOutput,
-            129 => SkbDropReason::RecursionLimit,
-            130 => SkbDropReason::Max,
+            68 => SkbDropReason::MacvlanBroadcastBacklog,
+            69 => SkbDropReason::IpvlanMulticastBacklog,
+            70 => SkbDropReason::Xdp,
+            71 => SkbDropReason::TcIngress,
+            72 => SkbDropReason::UnhandledProto,
+            73 => SkbDropReason::SkbCsum,
+            74 => SkbDropReason::SkbGsoSeg,
+            75 => SkbDropReason::SkbBadGso,
+            76 => SkbDropReason::SkbUcopyFault,
+            77 => SkbDropReason::DevHdr,
+            78 => SkbDropReason::DevReady,
+            79 => SkbDropReason::FullRing,
+            80 => SkbDropReason::NoMem,
+            81 => SkbDropReason::HdrTrunc,
+            82 => SkbDropReason::TapFilter,
+            83 => SkbDropReason::TapTxFilter,
+            84 => SkbDropReason::IcmpCsum,
+            85 => SkbDropReason::InvalidProto,
+            86 => SkbDropReason::IpInaddrErrors,
+            87 => SkbDropReason::IpInNoRoutes,
+            88 => SkbDropReason::IpLocalSource,
+            89 => SkbDropReason::IpInvalidSource,
+            90 => SkbDropReason::IpLocalnet,
+            91 => SkbDropReason::IpInvalidDest,
+            92 => SkbDropReason::PktTooBig,
+            93 => SkbDropReason::DupFrag,
+            94 => SkbDropReason::FragReasmTimeout,
+            95 => SkbDropReason::FragTooFar,
+            96 => SkbDropReason::TcpMinTtl,
+            97 => SkbDropReason::Ipv6BadExthdr,
+            98 => SkbDropReason::Ipv6TooManyExthdrs,
+            99 => SkbDropReason::Ipv6NdiscFrag,
+            100 => SkbDropReason::Ipv6NdiscHopLimit,
+            101 => SkbDropReason::Ipv6NdiscBadCode,
+            102 => SkbDropReason::Ipv6NdiscBadOptions,
+            103 => SkbDropReason::Ipv6NdiscNsOtherhost,
+            104 => SkbDropReason::QueuePurge,
+            105 => SkbDropReason::TcCookieError,
+            106 => SkbDropReason::PacketSocketError,
+            107 => SkbDropReason::TcChainNotFound,
+            108 => SkbDropReason::TcReclassifyLoop,
+            109 => SkbDropReason::VxlanInvalidHdr,
+            110 => SkbDropReason::VxlanVniNotFound,
+            111 => SkbDropReason::MacInvalidSource,
+            112 => SkbDropReason::VxlanEntryExists,
+            113 => SkbDropReason::NoTxTarget,
+            114 => SkbDropReason::IpTunnelEcn,
+            115 => SkbDropReason::TunnelTxinfo,
+            116 => SkbDropReason::LocalMac,
+            117 => SkbDropReason::ArpPvlanDisable,
+            118 => SkbDropReason::MacIeeeMacControl,
+            119 => SkbDropReason::BridgeIngressStpState,
+            120 => SkbDropReason::CanRxInvalidFrame,
+            121 => SkbDropReason::CanfdRxInvalidFrame,
+            122 => SkbDropReason::CanxlRxInvalidFrame,
+            123 => SkbDropReason::PmemAlloc,
+            124 => SkbDropReason::PspInput,
+            125 => SkbDropReason::PspOutput,
+            126 => SkbDropReason::RecursionLimit,
+            127 => SkbDropReason::Max,
             _ => SkbDropReason::Max,
         }
     }
@@ -481,11 +472,8 @@ pub fn reason_name(reason: SkbDropReason) -> &'static str {
         SkbDropReason::QdiscBurstDrop => "QDISC_BURST_DROP",
         SkbDropReason::QdiscOverlimit => "QDISC_OVERLIMIT",
         SkbDropReason::QdiscCongested => "QDISC_CONGESTED",
-        SkbDropReason::CakeFlood => "CAKE_FLOOD",
-        SkbDropReason::FqBandLimit => "FQ_BAND_LIMIT",
-        SkbDropReason::FqHorizonLimit => "FQ_HORIZON_LIMIT",
-        SkbDropReason::FqFlowLimit => "FQ_FLOW_LIMIT",
-        SkbDropReason::CpuBacklog => "CPU_BACKLOG",
+        SkbDropReason::MacvlanBroadcastBacklog => "MACVLAN_BROADCAST_BACKLOG",
+        SkbDropReason::IpvlanMulticastBacklog => "IPVLAN_MULTICAST_BACKLOG",
         SkbDropReason::Xdp => "XDP",
         SkbDropReason::TcIngress => "TC_INGRESS",
         SkbDropReason::UnhandledProto => "UNHANDLED_PROTO",
@@ -514,6 +502,7 @@ pub fn reason_name(reason: SkbDropReason) -> &'static str {
         SkbDropReason::FragTooFar => "FRAG_TOO_FAR",
         SkbDropReason::TcpMinTtl => "TCP_MINTTL",
         SkbDropReason::Ipv6BadExthdr => "IPV6_BAD_EXTHDR",
+        SkbDropReason::Ipv6TooManyExthdrs => "IPV6_TOO_MANY_EXTHDRS",
         SkbDropReason::Ipv6NdiscFrag => "IPV6_NDISC_FRAG",
         SkbDropReason::Ipv6NdiscHopLimit => "IPV6_NDISC_HOP_LIMIT",
         SkbDropReason::Ipv6NdiscBadCode => "IPV6_NDISC_BAD_CODE",
@@ -539,7 +528,6 @@ pub fn reason_name(reason: SkbDropReason) -> &'static str {
         SkbDropReason::CanfdRxInvalidFrame => "CANFD_RX_INVALID_FRAME",
         SkbDropReason::CanxlRxInvalidFrame => "CANXL_RX_INVALID_FRAME",
         SkbDropReason::PmemAlloc => "PFMEMALLOC",
-        SkbDropReason::DualPi2StepDrop => "DUALPI2_STEP_DROP",
         SkbDropReason::PspInput => "PSP_INPUT",
         SkbDropReason::PspOutput => "PSP_OUTPUT",
         SkbDropReason::RecursionLimit => "RECURSION_LIMIT",

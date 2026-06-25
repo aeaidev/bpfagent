@@ -15,8 +15,9 @@ use kfree_skb_common::SkbDropReason;
 // field:enum skb_drop_reason reason; offset:36; size:4; signed:0;
 
 // Map to count drops by reason - using interior mutability
+// MAX reason is 127, so we need 128 entries (0-127)
 #[map]
-pub static DROP_COUNTS: HashMap<u32, u64> = HashMap::with_max_entries(131, 0);
+pub static DROP_COUNTS: HashMap<u32, u64> = HashMap::with_max_entries(128, 0);
 
 #[tracepoint]
 pub fn kfree_skb(ctx: TracePointContext) -> u32 {
