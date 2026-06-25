@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
-
+/**
+ * Copyright (c) 2026 Katim LLC
+ * All rights reserved.
+ */
 use aya_ebpf::{
     EbpfContext,
     macros::{map, tracepoint},

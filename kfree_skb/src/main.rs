@@ -1,3 +1,7 @@
+/**
+ * Copyright (c) 2026 Katim LLC
+ * All rights reserved.
+ */
 use std::time::Duration;
 
 use aya::{

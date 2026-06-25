@@ -1,57 +1,108 @@
 # kfree_skb
 
+An eBPF application that traces kernel packet drops via the `kfree_skb` tracepoint and reports drop counts by reason.
+
+## Overview
+
+This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statistics on why network packets are being dropped. It provides real-time visibility into network stack issues by tracking drop reasons defined in the kernel's `enum skb_drop_reason`.
+
+## Features
+
+- Traces packet drops at the `kfree_skb` kernel tracepoint
+- Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
+- Displays drop statistics every 3 seconds
+- Uses BPF CO-RE compatible types via Aya framework
+
 ## Prerequisites
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+1. **Rust toolchains**:
+   ```bash
+   rustup toolchain install stable
+   rustup toolchain install nightly --component rust-src
+   ```
+
+2. **bpf-linker** (required for building eBPF programs):
+   ```bash
+   cargo install bpf-linker
+   ```
+
+3. **Linux kernel** with:
+   - BPF support (CONFIG_BPF=y)
+   - Tracepoint support for `skb:kfree_skb`
+   - BTF debug info (CONFIG_DEBUG_INFO_BTF=y) - for best compatibility
 
 ## Build & Run
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+### Standard build (x86_64 Linux)
 
-```shell
-cargo run --release
+```bash
+# Build in release mode
+cargo build --release
+
+# Run with sudo (required for eBPF)
+sudo cargo run --release
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+### Check for errors without running
 
-## Cross-compiling on macOS
-
-Cross compilation should work on both Intel and Apple Silicon Macs.
-
-```shell
-CC=${ARCH}-linux-musl-gcc cargo build --package kfree_skb --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
+```bash
+cargo check --all
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/kfree_skb` can be
-copied to a Linux server or VM and run there.
 
-## License
+### Cross-compiling for Petalinux 2024.2
 
-With the exception of eBPF code, kfree_skb is distributed under the terms
-of either the [MIT license] or the [Apache License] (version 2.0), at your
-option.
+To build for ARM64 Linux targets (aarch64-unknown-linux-musl):
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+```bash
+# Install the target
+rustup target add aarch64-unknown-linux-musl
 
-### eBPF
+# Install musl cross-compiler (Ubuntu/Debian)
+sudo apt-get install musl-tools
 
-All eBPF code is distributed under either the terms of the
-[GNU General Public License, Version 2] or the [MIT license], at your
-option.
+# Build for aarch64
+CC=aarch64-linux-musl-gcc cargo build --package kfree_skb --release \
+  --target=aarch64-unknown-linux-musl \
+  --config=target.aarch64-unknown-linux-musl.linker="aarch64-linux-musl-gcc"
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
+# The binary will be at:
+# target/aarch64-unknown-linux-musl/release/kfree_skb
+```
 
-[Apache license]: LICENSE-APACHE
-[MIT license]: LICENSE-MIT
-[GNU General Public License, Version 2]: LICENSE-GPL2
+## How It Works
+
+1. The eBPF program attaches to the `kfree_skb` tracepoint
+2. When a packet is dropped, the program reads the drop reason from the tracepoint context
+3. The reason is used as a key to increment a counter in a hash map
+4. The user-space program periodically reads and displays the counters
+
+## Output Example
+
+```
+Waiting for Ctrl-C... (drops will be displayed periodically)
+
+Drop counts (total: 1234):
+  10 (TCP_CSUM               ): 456
+  64 (QDISC_DROP             ): 321
+   3 (NO_SOCKET              ): 234
+  55 (BPF_CGROUP_EGRESS      ): 123
+```
+
+## Mapping Drop Reasons
+
+The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include/linux/skbuff.h`):
+
+| Reason | Description |
+|--------|-------------|
+| 0-1 | Not dropped / Consumed |
+| 2-67 | Core network stack (TCP, UDP, IP, routing, etc.) |
+| 68-69 | MACVLAN/IPvlan backlog |
+| 70-83 | Device/queue issues (XDP, TC, rings, memory) |
+| 84-103 | Protocol-specific (ICMP, IP, IPv6) |
+| 104-126 | Qdisc, TC, VXLAN, CAN, PSP, etc. |
+
+## Project Structure
+
+- `kfree_skb/` - User-space Rust application
+- `kfree_skb-ebpf/` - Kernel-space eBPF program source
+- `kfree_skb-common/` - Shared types between user and eBPF code
