@@ -7,7 +7,7 @@ use aya_ebpf::{
     maps::HashMap,
     programs::TracePointContext,
 };
-use aya_log_ebpf::info;
+use aya_log_ebpf::{debug, info};
 use kfree_skb_common::SkbDropReason;
 
 // The kfree_skb tracepoint format (from /sys/kernel/tracing/events/skb/kfree_skb/format):
@@ -38,7 +38,7 @@ unsafe fn try_kfree_skb(ctx: TracePointContext) -> Result<u32, u32> {
     // Convert to our SkbDropReason enum
     let reason: SkbDropReason = reason_raw.into();
 
-    info!(
+    debug!(
         &ctx,
         "kfree_skb called with reason: {} ({})",
         reason_raw,
