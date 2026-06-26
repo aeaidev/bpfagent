@@ -10,7 +10,7 @@ use aya::{
 };
 use aya_log::EbpfLogger;
 use kfree_skb_common::{SkbDropReason, reason_name};
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use tokio::signal;
 
 #[tokio::main]
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Waiting for Ctrl-C... (drops will be displayed periodically)");
 
-    // Display drops every second until Ctrl-C
+    // Display drops every 3 second until Ctrl-C
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -95,7 +95,7 @@ fn display_drop_counts(drop_counts: &mut HashMap<&mut MapData, u32, u64>) -> any
     all_counts.sort_by(|a, b| b.2.cmp(&a.2));
 
     if all_counts.is_empty() {
-        info!("No drops recorded yet");
+        trace!("No drops recorded yet");
     } else {
         info!(
             "Drop counts (total: {}):",
