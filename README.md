@@ -1,4 +1,4 @@
-# kfree_skb
+# EBPF
 
 An eBPF application that traces kernel packet drops via the `kfree_skb` tracepoint and reports drop counts by reason.
 
@@ -12,6 +12,8 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 - Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
 - Displays drop statistics every 3 seconds
 - Uses BPF CO-RE compatible types via Aya framework
+- **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
+- **Code quality improvements** - refactored HTTP response handlers, removed unused code
 
 ## Prerequisites
 
@@ -76,6 +78,65 @@ CC=aarch64-linux-musl-gcc cargo build --package kfree_skb --release \
 3. The reason is used as a key to increment a counter in a hash map
 4. The user-space program periodically reads and displays the counters
 
+## Code Quality & Improvements
+
+### Recent Improvements
+
+- **Removed dead code**: Eliminated unused `drop_size` field from `Metrics` struct
+- **Refactored HTTP handlers**: Extracted duplicate HTTP response logic into separate functions (`handle_metrics_response`, `handle_not_found_response`)
+- **Improved code organization**: Cleaner separation of concerns with dedicated response handler functions
+
+## Prometheus Metrics Exporter
+
+The application exposes a Prometheus metrics endpoint on port **9090** at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
+
+### Running the application
+
+```bash
+sudo cargo run --release
+```
+
+### Accessing metrics
+
+Once the application is running, you can retrieve metrics in Prometheus format:
+
+```bash
+curl http://localhost:9090/metrics
+```
+
+Or configure Prometheus to scrape the endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: 'kfree_skb'
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `kfree_skb_total_drops` | Counter | `reason` | Total number of SKB drops |
+| `kfree_skb_drops_by_reason` | Counter | `reason_code`, `reason_name` | Number of drops by reason |
+| `kfree_skb_drops_total_bytes` | Gauge | `reason` | Total bytes dropped by reason |
+
+### Metrics Output Example
+
+```
+# HELP kfree_skb_total_drops Total number of SKB drops
+# TYPE kfree_skb_total_drops counter
+kfree_skb_total_drops{reason="all"} 1234
+# HELP kfree_skb_drops_by_reason Number of drops by reason
+# TYPE kfree_skb_drops_by_reason counter
+kfree_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
+kfree_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
+kfree_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
+# HELP kfree_skb_drops_total_bytes Total bytes dropped by reason
+# TYPE kfree_skb_drops_total_bytes gauge
+kfree_skb_drops_total_bytes{reason="all"} 524288
+```
+
 ## Output Example
 
 ```
@@ -103,6 +164,6 @@ The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include
 
 ## Project Structure
 
-- `kfree_skb/` - User-space Rust application
+- `kfree_skb/` - User-space Rust application with Prometheus metrics exporter
 - `kfree_skb-ebpf/` - Kernel-space eBPF program source
 - `kfree_skb-common/` - Shared types between user and eBPF code
