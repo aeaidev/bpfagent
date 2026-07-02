@@ -32,8 +32,8 @@ pub fn kfree_skb(ctx: TracePointContext) -> u32 {
 
 unsafe fn try_kfree_skb(ctx: TracePointContext) -> Result<u32, u32> {
     // Read the reason field at offset 36 using bpf_probe_read_kernel
-    // The tracepoint format has reason at offset 36
-    let reason_ptr = unsafe { ctx.as_ptr().add(36) } as *const u32;
+    // The tracepoint format has reason at offset 36 (28 for kernel version 6.8)
+    let reason_ptr = unsafe { ctx.as_ptr().add(28) } as *const u32;
 
     // Use bpf_probe_read_kernel to safely read the value
     let reason_raw: u32 =
