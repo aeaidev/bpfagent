@@ -45,6 +45,31 @@ cargo build --release
 sudo cargo run --release
 ```
 
+### Command-line Options
+
+The application supports command-line arguments for customizing the metrics server IP address and port:
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--metrics-ip` | `-i` | `127.0.0.1` | Metrics server IP address |
+| `--metrics-port` | `-p` | `9090` | Metrics server port |
+
+**Examples:**
+
+```bash
+# Use default address (127.0.0.1:9090)
+sudo cargo run --release
+
+# Listen on all interfaces on port 9090
+sudo cargo run --release -- --metrics-ip 0.0.0.0
+
+# Use a custom port
+sudo cargo run --release -- --metrics-port 8080
+
+# Use custom IP and port (short forms)
+sudo cargo run --release -- -i 0.0.0.0 -p 9999
+```
+
 ### Check for errors without running
 
 ```bash
@@ -88,7 +113,9 @@ CC=aarch64-linux-musl-gcc cargo build --package kfree_skb --release \
 
 ## Prometheus Metrics Exporter
 
-The application exposes a Prometheus metrics endpoint on port **9090** at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
+The application exposes a Prometheus metrics endpoint (default: **127.0.0.1:9090**) at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
+
+You can customize the metrics server IP address and port using the `--metrics-ip` (`-i`) and `--metrics-port` (`-p`) command-line options.
 
 ### Running the application
 
@@ -98,13 +125,13 @@ sudo cargo run --release
 
 ### Accessing metrics
 
-Once the application is running, you can retrieve metrics in Prometheus format:
+Once the application is running, you can retrieve metrics in Prometheus format (adjust port if using a custom address):
 
 ```bash
 curl http://localhost:9090/metrics
 ```
 
-Or configure Prometheus to scrape the endpoint:
+Or configure Prometheus to scrape the endpoint (adjust address if using a custom metrics server IP/port):
 
 ```yaml
 scrape_configs:

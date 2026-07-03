@@ -11,6 +11,7 @@ kfree_skb-common = { path = "../kfree_skb-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
