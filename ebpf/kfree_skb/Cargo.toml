@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-kfree_skb-common = { path = "../kfree_skb-common" }
+kfree_skb-common = { path = "../../common/kfree_skb" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }

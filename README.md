@@ -99,20 +99,10 @@ CC=aarch64-linux-musl-gcc cargo build --package kfree_skb --release \
 
 ## How It Works
 
-1. The eBPF program attaches to the `kfree_skb` tracepoint
+1. The eBPF program attaches to the tracepoint like `kfree_skb`
 2. When a packet is dropped, the program reads the drop reason from the tracepoint context
 3. The reason is used as a key to increment a counter in a hash map
 4. The user-space program periodically reads and displays the counters
-
-## Code Quality & Improvements
-
-### Recent Improvements
-
-- **Removed dead code**: Eliminated unused `drop_size` field from `Metrics` struct
-- **Refactored HTTP handlers**: Extracted duplicate HTTP response logic into separate functions (`handle_metrics_response`, `handle_not_found_response`)
-- **Improved code organization**: Cleaner separation of concerns with dedicated response handler functions
-- **Added command-line options**: Customizable metrics server IP and port with short forms (`-i`, `-p`)
-- **Removed unused kfree_skb_net directory**: Cleaned up incomplete project structure
 
 ## Prometheus Metrics Exporter
 
@@ -191,14 +181,16 @@ The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include
 ## Project Structure
 
 ```
-kfree_skb/
-├── kfree_skb/          # User-space Rust application with Prometheus metrics exporter
-├── kfree_skb-ebpf/     # Kernel-space eBPF program source
-└── kfree_skb-common/   # Shared types between user and eBPF code
+bpfagent/
+├── bpfagent/           # User-space Rust application with Prometheus metrics exporter
+├── common/
+│   └── kfree_skb/      # Shared types between user and eBPF code
+└── ebpf/
+    └── kfree_skb/      # Kernel-space eBPF program source
 ```
 
 ### Key Files
 
-- `kfree_skb/src/main.rs` - Main application entry point with Prometheus metrics server
-- `kfree_skb-ebpf/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
-- `kfree_skb-common/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)
+- `bpfagent/src/main.rs` - Main application entry point with Prometheus metrics server
+- `ebpf/kfree_skb/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
+- `common/kfree_skb/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)

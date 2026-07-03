@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "kfree_skb",
-    "kfree_skb-common",
-    "kfree_skb-ebpf",
+    "bpfagent",
+    "common/kfree_skb",
+    "ebpf/kfree_skb",
 ]
-default-members = ["kfree_skb", "kfree_skb-common"]
+default-members = ["bpfagent", "common/kfree_skb"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

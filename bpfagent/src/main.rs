@@ -19,19 +19,19 @@ use tokio_util::sync::CancellationToken;
 /// Command-line arguments for kfree_skb
 #[derive(Parser, Debug)]
 #[command(
-    name = "kfree_skb",
+    name = "bpfagent",
     author = "Katim LLC",
     version,
-    about = "eBPF application that traces kernel packet drops via kfree_skb",
+    about = "EBPF program manager and Prometheus metrics exrtactor",
     long_about = None
 )]
 struct Args {
     /// Metrics server IP address
-    #[arg(short = 'i', long, default_value = "127.0.0.1")]
+    #[arg(short = 'i', long, default_value = "0.0.0.0")]
     metrics_ip: String,
 
     /// Metrics server port
-    #[arg(short = 'p', long, default_value = "9090")]
+    #[arg(short = 'p', long, default_value = "9190")]
     metrics_port: u16,
 }
 

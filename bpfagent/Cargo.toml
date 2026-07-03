@@ -1,12 +1,12 @@
 [package]
-name = "kfree_skb"
+name = "bpfagent"
 version = "0.1.0"
 edition.workspace = true
 
 license.workspace = true
 
 [dependencies]
-kfree_skb-common = { path = "../kfree_skb-common", features = ["user"] }
+kfree_skb-common = { path = "../common/kfree_skb", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -32,5 +32,5 @@ aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 
 [[bin]]
-name = "kfree_skb"
+name = "bpfagent"
 path = "src/main.rs"
