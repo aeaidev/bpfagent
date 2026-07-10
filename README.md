@@ -1,6 +1,6 @@
-# EBPF
+# BPF Agent
 
-An eBPF application that traces kernel packet drops via the `kfree_skb` tracepoint and reports drop counts by reason.
+A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. Currently includes the `kfree_skb` program that traces kernel packet drops.
 
 ## Overview
 
@@ -8,13 +8,14 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 
 ## Features
 
-- Traces packet drops at the `kfree_skb` kernel tracepoint
+- **Modular architecture** - easy to add new eBPF programs via separate modules
+- **kfree_skb program** - traces packet drops at the kernel's `kfree_skb` tracepoint
 - Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
 - Displays drop statistics every 3 seconds
 - Uses BPF CO-RE compatible types via Aya framework
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
-- **Code quality improvements** - refactored HTTP response handlers, removed unused code
+- **Clean code organization** - separates concerns into modules (common, kfree_skb, metrics)
 
 ## Prerequisites
 
@@ -52,17 +53,17 @@ The application supports command-line arguments for customizing the metrics serv
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--metrics-ip` | `-i` | `127.0.0.1` | Metrics server IP address |
-| `--metrics-port` | `-p` | `9090` | Metrics server port |
+| `--metrics-ip` | `-i` | `0.0.0.0` | Metrics server IP address |
+| `--metrics-port` | `-p` | `9190` | Metrics server port |
 
 **Examples:**
 
 ```bash
-# Use default address (127.0.0.1:9090)
+# Use default address (0.0.0.0:9190)
 sudo cargo run --release
 
-# Listen on all interfaces on port 9090
-sudo cargo run --release -- --metrics-ip 0.0.0.0
+# Listen on localhost only
+sudo cargo run --release -- --metrics-ip 127.0.0.1
 
 # Use a custom port
 sudo cargo run --release -- --metrics-port 8080
@@ -89,24 +90,24 @@ rustup target add aarch64-unknown-linux-musl
 sudo apt-get install musl-tools
 
 # Build for aarch64
-CC=aarch64-linux-musl-gcc cargo build --package kfree_skb --release \
+CC=aarch64-linux-musl-gcc cargo build --package bpfagent --release \
   --target=aarch64-unknown-linux-musl \
   --config=target.aarch64-unknown-linux-musl.linker="aarch64-linux-musl-gcc"
 
 # The binary will be at:
-# target/aarch64-unknown-linux-musl/release/kfree_skb
+# target/aarch64-unknown-linux-musl/release/bpfagent
 ```
 
 ## How It Works
 
-1. The eBPF program attaches to the tracepoint like `kfree_skb`
-2. When a packet is dropped, the program reads the drop reason from the tracepoint context
-3. The reason is used as a key to increment a counter in a hash map
-4. The user-space program periodically reads and displays the counters
+1. The eBPF program (e.g., `kfree_skb`) attaches to a kernel tracepoint
+2. When an event occurs, the program reads context and increments counters in a hash map
+3. The user-space program periodically reads and displays the counters
+4. Prometheus metrics are updated with the collected data
 
 ## Prometheus Metrics Exporter
 
-The application exposes a Prometheus metrics endpoint (default: **127.0.0.1:9090**) at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
+The application exposes a Prometheus metrics endpoint (default: **0.0.0.0:9190**) at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
 
 You can customize the metrics server IP address and port using the `--metrics-ip` (`-i`) and `--metrics-port` (`-p`) command-line options.
 
@@ -121,16 +122,16 @@ sudo cargo run --release
 Once the application is running, you can retrieve metrics in Prometheus format (adjust port if using a custom address):
 
 ```bash
-curl http://localhost:9090/metrics
+curl http://localhost:9101/metrics
 ```
 
 Or configure Prometheus to scrape the endpoint (adjust address if using a custom metrics server IP/port):
 
 ```yaml
 scrape_configs:
-  - job_name: 'kfree_skb'
+  - job_name: 'bpfagent'
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['localhost:9101']
 ```
 
 ### Available Metrics
@@ -156,8 +157,6 @@ kfree_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
 ## Output Example
 
 ```
-Waiting for Ctrl-C... (drops will be displayed periodically)
-
 Drop counts (total: 1234):
   10 (TCP_CSUM               ): 456
   64 (QDISC_DROP             ): 321
@@ -182,7 +181,12 @@ The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include
 
 ```
 bpfagent/
-├── bpfagent/           # User-space Rust application with Prometheus metrics exporter
+├── bpfagent/           # User-space Rust application
+│   └── src/
+│       ├── main.rs     # Application entry point with argument parsing
+│       ├── common.rs   # Shared CLI arguments for bpfagent
+│       ├── kfree_skb.rs# kfree_skb-specific logic (metrics, display)
+│       └── metrics.rs  # Prometheus metrics HTTP server
 ├── common/
 │   └── kfree_skb/      # Shared types between user and eBPF code
 └── ebpf/
@@ -191,6 +195,9 @@ bpfagent/
 
 ### Key Files
 
-- `bpfagent/src/main.rs` - Main application entry point with Prometheus metrics server
+- `bpfagent/src/main.rs` - Main application entry point with argument parsing
+- `bpfagent/src/common.rs` - Shared CLI arguments (metrics IP/port)
+- `bpfagent/src/kfree_skb.rs` - kfree_skb-specific logic (metrics, display functions)
+- `bpfagent/src/metrics.rs` - Prometheus metrics HTTP server
 - `ebpf/kfree_skb/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
 - `common/kfree_skb/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)
