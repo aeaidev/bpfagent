@@ -39,6 +39,22 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 
 ### Standard build (x86_64 Linux)
 
+### Running Modes
+
+The application supports two running modes:
+
+**Daemon Mode (default)**
+- Runs in the background without stdout output
+- Only Prometheus metrics endpoint provides feedback
+- Use `--daemon=false` to disable or `--verbose` for logging
+
+**Interactive Mode**
+- Displays drop statistics to stdout every 3 seconds
+- Use `--daemon=false` to enable interactive mode
+- Use `--verbose` to enable verbose logging in daemon mode
+
+The metrics server listens on port **9101** by default (changeable with `--metrics-port`).
+
 ```bash
 # Build in release mode
 cargo build --release
@@ -49,18 +65,24 @@ sudo cargo run --release
 
 ### Command-line Options
 
-The application supports command-line arguments for customizing the metrics server IP address and port:
-
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--metrics-ip` | `-i` | `0.0.0.0` | Metrics server IP address |
-| `--metrics-port` | `-p` | `9190` | Metrics server port |
+| `-d, --daemon` | | `true` | Run in daemon mode (no stdout output) |
+| `-i, --metrics-ip` | | `0.0.0.0` | Metrics server IP address |
+| `-p, --metrics-port` | | `9101` | Metrics server port |
+| `-v, --verbose` | | | Enable verbose output (overrides daemon mode for interactive debugging) |
 
 **Examples:**
 
 ```bash
-# Use default address (0.0.0.0:9190)
+# Default: run in daemon mode (background, no stdout)
 sudo cargo run --release
+
+# Run in interactive mode with stdout output
+sudo cargo run --release -- --daemon=false
+
+# Run in daemon mode but with verbose logging
+sudo cargo run --release -- --verbose
 
 # Listen on localhost only
 sudo cargo run --release -- --metrics-ip 127.0.0.1
@@ -107,7 +129,7 @@ CC=aarch64-linux-musl-gcc cargo build --package bpfagent --release \
 
 ## Prometheus Metrics Exporter
 
-The application exposes a Prometheus metrics endpoint (default: **0.0.0.0:9190**) at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
+The application exposes a Prometheus metrics endpoint (default: **0.0.0.0:9101**) at the `/metrics` path. This allows you to monitor packet drops using Prometheus and visualize them with Grafana.
 
 You can customize the metrics server IP address and port using the `--metrics-ip` (`-i`) and `--metrics-port` (`-p`) command-line options.
 
