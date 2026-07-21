@@ -1,7 +1,15 @@
-use aya::maps::{HashMap, MapData};
+use std::any::Any;
+
+use aya::{
+    Ebpf,
+    maps::{HashMap, MapData},
+    programs::TracePoint,
+};
 use kfree_skb_common::{SkbDropReason, reason_name};
-use log::{info, trace};
+use log::{debug, info, trace};
 use prometheus::{IntCounterVec, Registry};
+
+use crate::program::EbpfProgram;
 
 /// Prometheus metrics for kfree_skb
 pub struct Metrics {
@@ -72,4 +80,71 @@ pub fn display_drop_counts(
     }
 
     Ok(())
+}
+
+/// BPF program wrapper for kfree_skb
+pub struct KfreeSkbProgram {
+    pub name: String,
+    pub enabled: bool,
+    pub ebpf: Option<Ebpf>,
+}
+
+impl KfreeSkbProgram {
+    pub fn new() -> Self {
+        Self {
+            name: "kfree_skb".to_string(),
+            enabled: true,
+            ebpf: None,
+        }
+    }
+
+    /// Get the BPF program map for accessing DROP_COUNTS
+    pub fn get_drop_counts_map(&mut self) -> Option<aya::maps::HashMap<&mut MapData, u32, u64>> {
+        let ebpf = self.ebpf.as_mut()?;
+        aya::maps::HashMap::<&mut MapData, u32, u64>::try_from(ebpf.map_mut("DROP_COUNTS").unwrap())
+            .ok()
+    }
+}
+
+impl Default for KfreeSkbProgram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EbpfProgram for KfreeSkbProgram {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn load(&mut self) -> Result<(), anyhow::Error> {
+        debug!("Loading BPF program: {}", self.name);
+
+        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/kfree_skb"
+        )))?;
+
+        // Get the BPF program and map
+        let program: &mut TracePoint = ebpf.program_mut("kfree_skb").unwrap().try_into()?;
+        program.load()?;
+        program.attach("skb", "kfree_skb")?;
+
+        self.ebpf = Some(ebpf);
+
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        debug!("Started BPF program: {}", self.name);
+        Ok(())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }

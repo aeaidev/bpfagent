@@ -2,15 +2,15 @@ mod common;
 mod config;
 mod kfree_skb;
 mod metrics;
+mod program;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use aya::{Ebpf, maps::MapData};
 use aya_log::EbpfLogger;
 use clap::Parser;
 use common::BpfAgentArgs;
 use daemonize::Daemonize;
-use kfree_skb::{Metrics, display_drop_counts};
+use kfree_skb::{KfreeSkbProgram, Metrics, display_drop_counts};
 use log::{debug, warn};
 use metrics::run_metrics_server;
 use prometheus::Registry;
@@ -58,41 +58,92 @@ fn main() -> anyhow::Result<()> {
         let registry = Registry::new();
         let metrics = Metrics::new(&registry);
 
-        // Load the BPF program
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/kfree_skb"
-        )))?;
+        // Get enabled program names from config
+        // If config has explicit programs, use those; otherwise use default set
+        let enabled_program_names = if daemon_config.has_explicit_programs() {
+            daemon_config.enabled_program_names()
+        } else {
+            // No explicit config - enable all known programs
+            vec!["kfree_skb".to_string()]
+        };
 
-        // Initialize BPF logger
-        match EbpfLogger::init(&mut ebpf) {
-            Err(e) => {
-                // This can happen if you remove all log statements from your eBPF program.
-                warn!("failed to initialize eBPF logger: {e}");
-            }
-            Ok(logger) => {
-                let mut logger =
-                    tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-                tokio::task::spawn(async move {
-                    loop {
-                        let mut guard = logger.readable_mut().await.unwrap();
-                        guard.get_inner_mut().flush();
-                        guard.clear_ready();
-                    }
-                });
+        if enabled_program_names.is_empty() {
+            debug!("No programs enabled, exiting");
+            return Ok(());
+        }
+
+        debug!("Enabled programs from config: {:?}", enabled_program_names);
+
+        // Create program instances based on enabled names
+        let mut programs: HashMap<String, Box<dyn program::EbpfProgram>> = HashMap::new();
+
+        for program_name in &enabled_program_names {
+            match program_name.as_str() {
+                "kfree_skb" => {
+                    debug!("Registering kfree_skb program");
+                    programs.insert(program_name.clone(), Box::new(KfreeSkbProgram::new()));
+                }
+                _ => {
+                    warn!("Unknown program in config: {}", program_name);
+                }
             }
         }
 
-        // Get the BPF program and map
-        let program: &mut aya::programs::TracePoint =
-            ebpf.program_mut("kfree_skb").unwrap().try_into()?;
-        program.load()?;
-        program.attach("skb", "kfree_skb")?;
+        // Load all enabled programs
+        for (name, program) in &mut programs {
+            debug!("Loading program: {}", name);
+            program.load()?;
+        }
 
-        // Get the DROP_COUNTS map
-        let drop_counts = aya::maps::HashMap::<&mut MapData, u32, u64>::try_from(
-            ebpf.map_mut("DROP_COUNTS").unwrap(),
-        )?;
+        // Initialize BPF logger (need to get ebpf from one of the programs)
+        // For now, get it from kfree_skb
+        if let Some(kfree_skb) = programs.get_mut("kfree_skb") {
+            let kfree_skb_any = kfree_skb.as_any_mut();
+            if let Some(kfree_skb) = kfree_skb_any.downcast_mut::<KfreeSkbProgram>() {
+                if let Some(ebpf) = kfree_skb.ebpf.as_mut() {
+                    match EbpfLogger::init(ebpf) {
+                        Err(e) => {
+                            warn!("failed to initialize eBPF logger: {e}");
+                        }
+                        Ok(logger) => {
+                            let mut logger = tokio::io::unix::AsyncFd::with_interest(
+                                logger,
+                                tokio::io::Interest::READABLE,
+                            )?;
+                            tokio::task::spawn(async move {
+                                loop {
+                                    let mut guard = logger.readable_mut().await.unwrap();
+                                    guard.get_inner_mut().flush();
+                                    guard.clear_ready();
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Start all enabled programs
+        for (name, program) in &mut programs {
+            debug!("Starting program: {}", name);
+            program.start()?;
+        }
+
+        // Get the DROP_COUNTS map from kfree_skb
+        let drop_counts = if programs.contains_key("kfree_skb") {
+            let kfree_skb = programs.get_mut("kfree_skb").unwrap();
+            // Since we only support kfree_skb, we can safely downcast
+            let kfree_skb = kfree_skb
+                .as_any_mut()
+                .downcast_mut::<KfreeSkbProgram>()
+                .ok_or_else(|| anyhow::anyhow!("failed to downcast kfree_skb"))?;
+            kfree_skb
+                .get_drop_counts_map()
+                .ok_or_else(|| anyhow::anyhow!("kfree_skb DROP_COUNTS map not found"))?
+        } else {
+            return Err(anyhow::anyhow!("kfree_skb program not found"));
+        };
+
         let drop_counts = Arc::new(std::sync::Mutex::new(drop_counts));
 
         // Initialize cancellation token for graceful shutdown
@@ -107,7 +158,7 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Display drops and update metrics every 3 second until Ctrl-C
+        // Display drops and update metrics every 3 seconds until Ctrl-C
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

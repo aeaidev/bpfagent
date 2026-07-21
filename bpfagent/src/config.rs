@@ -3,6 +3,17 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use serde::Deserialize;
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct EbpfProgramConfig {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
     pub pid_file: String,
@@ -10,6 +21,8 @@ pub struct DaemonConfig {
     pub user: String,
     pub group: String,
     pub log_file: String,
+    #[serde(default)]
+    pub ebpf_programs: Vec<EbpfProgramConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -20,6 +33,7 @@ impl Default for DaemonConfig {
             user: "root".to_string(),
             group: "root".to_string(),
             log_file: "/tmp/bpfagent.log".to_string(),
+            ebpf_programs: Vec::new(),
         }
     }
 }
@@ -71,5 +85,39 @@ impl DaemonConfig {
             .map_err(|e| anyhow!("failed to parse config file {}: {}", path.display(), e))?;
 
         Ok(config)
+    }
+
+    /// Check if a specific EBPF program is enabled
+    pub fn is_program_enabled(&self, program_name: &str) -> bool {
+        if self.ebpf_programs.is_empty() {
+            // If no programs are specified in config, enable all
+            return true;
+        }
+        for program in &self.ebpf_programs {
+            if program.name == program_name {
+                return program.enabled;
+            }
+        }
+        // If program is not in config but other programs are listed, disable it
+        false
+    }
+
+    /// Get list of enabled program names
+    pub fn enabled_program_names(&self) -> Vec<String> {
+        if self.ebpf_programs.is_empty() {
+            // If no programs are specified in config, return empty (all enabled)
+            // We'll use this to detect if config has explicit programs
+            return vec![];
+        }
+        self.ebpf_programs
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Check if config has explicit program specifications
+    pub fn has_explicit_programs(&self) -> bool {
+        !self.ebpf_programs.is_empty()
     }
 }
