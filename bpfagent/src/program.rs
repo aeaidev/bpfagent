@@ -1,81 +1,71 @@
-use std::any::Any;
+use std::{any::Any, collections::HashMap, sync::Arc};
+
+/// Trait for EBPF programs that support metrics display
+pub trait MetricsDisplay {
+    /// Set the Prometheus registry for this program
+    fn set_metrics_registry(&mut self, registry: Arc<prometheus::Registry>) -> anyhow::Result<()>;
+
+    /// Display metrics (e.g., drop counts) and update Prometheus metrics
+    fn display_metrics(&mut self) -> anyhow::Result<()>;
+}
 
 /// Trait for EBPF programs
 pub trait EbpfProgram {
-    /// Returns the program name
-    fn name(&self) -> &str;
+    /// Returns the program name (config name)
+    #[allow(dead_code)]
+    fn name(&self) -> &str {
+        self.bpf_program_name()
+    }
 
-    /// Returns the enabled status
-    fn enabled(&self) -> bool;
+    /// Returns the BPF program name inside the object file
+    fn bpf_program_name(&self) -> &str;
 
     /// Loads the BPF program
     fn load(&mut self) -> Result<(), anyhow::Error>;
 
-    /// Starts the program (returns a future that runs until cancelled)
+    /// Starts the program
     fn start(&mut self) -> anyhow::Result<()>;
 
     /// Downcast to Any for type-specific access
+    #[allow(dead_code)]
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Check if this program supports metrics display
+    fn supports_metrics(&self) -> bool {
+        false
+    }
+
+    /// Get a mutable reference to the MetricsDisplay trait if supported
+    fn as_metrics_mut(&mut self) -> Option<&mut dyn MetricsDisplay> {
+        None
+    }
 }
 
-/// Registry for EBPF programs
+/// Registry for EBPF programs - maps config names to program constructors
 pub struct ProgramRegistry {
-    programs: Vec<Box<dyn EbpfProgram>>,
-    enabled_programs: Vec<String>,
+    registry: HashMap<String, Box<dyn Fn() -> Box<dyn EbpfProgram> + Send + Sync>>,
 }
 
 impl ProgramRegistry {
     pub fn new() -> Self {
         Self {
-            programs: Vec::new(),
-            enabled_programs: Vec::new(),
+            registry: HashMap::new(),
         }
     }
 
-    /// Register a program with the registry
-    pub fn register(&mut self, program: Box<dyn EbpfProgram>) {
-        self.programs.push(program);
+    pub fn register<F>(&mut self, config_name: &str, constructor: F)
+    where
+        F: Fn() -> Box<dyn EbpfProgram> + Send + Sync + 'static,
+    {
+        self.registry
+            .insert(config_name.to_string(), Box::new(constructor));
     }
 
-    /// Configure which programs are enabled based on config
-    pub fn configure_from_config(&mut self, config: &crate::config::DaemonConfig) {
-        self.enabled_programs.clear();
-
-        for program in &mut self.programs {
-            let name = program.name().to_string();
-            if config.is_program_enabled(&name) {
-                self.enabled_programs.push(name);
-            }
-        }
+    pub fn create_program(&self, config_name: &str) -> Option<Box<dyn EbpfProgram>> {
+        self.registry.get(config_name).map(|f| f())
     }
 
-    /// Get list of enabled program names
-    pub fn enabled_programs(&self) -> &[String] {
-        &self.enabled_programs
-    }
-
-    /// Get mutable reference to a program by name
-    pub fn get_program_mut(&mut self, name: &str) -> Option<&mut Box<dyn EbpfProgram>> {
-        self.programs.iter_mut().find(|p| p.name() == name)
-    }
-
-    /// Load all enabled programs
-    pub fn load_enabled(&mut self) -> Result<(), anyhow::Error> {
-        for program in &mut self.programs {
-            if self.enabled_programs.contains(&program.name().to_string()) {
-                program.load()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Start all enabled programs
-    pub fn start_enabled(&mut self) -> Result<(), anyhow::Error> {
-        for program in &mut self.programs {
-            if self.enabled_programs.contains(&program.name().to_string()) {
-                program.start()?;
-            }
-        }
-        Ok(())
+    pub fn available_programs(&self) -> Vec<String> {
+        self.registry.keys().cloned().collect()
     }
 }

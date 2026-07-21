@@ -1,31 +1,34 @@
-use std::io::Read;
+use std::{io::Read, sync::Arc};
 
-use log::{debug, info, warn};
+use log::debug;
 use prometheus::{Encoder, Registry, TextEncoder};
 
 pub async fn run_metrics_server(
-    registry: Registry,
+    registry: Arc<Registry>,
     cancel_token: tokio_util::sync::CancellationToken,
     addr: String,
 ) -> anyhow::Result<()> {
-    // Create a simple HTTP server using a blocking approach
-    // This is simpler and works with the current tokio version
+    debug!("Starting metrics server on {}", addr);
+    // Use the provided registry for gathering metrics
     std::thread::spawn(move || {
-        let server = std::net::TcpListener::bind(&addr).expect("failed to bind metrics server");
-
-        info!("Prometheus metrics server listening on http://{}", addr);
+        let server = match std::net::TcpListener::bind(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to bind metrics server on {}: {}", addr, e);
+                return;
+            }
+        };
 
         for stream in server.incoming() {
             match stream {
                 Ok(mut stream) => {
-                    let registry = registry.clone();
-                    // Handle each request synchronously
+                    // Handle each request synchronously using the provided registry
                     if let Err(e) = handle_http_request(&mut stream, &registry) {
-                        debug!("metrics request failed: {e}");
+                        debug!("metrics request failed: {}", e);
                     }
                 }
                 Err(e) => {
-                    warn!("metrics listener accept failed: {e}");
+                    debug!("metrics listener accept failed: {}", e);
                 }
             }
         }
@@ -67,12 +70,18 @@ fn handle_metrics_response(
     stream: &mut std::net::TcpStream,
     registry: &Registry,
 ) -> anyhow::Result<()> {
+    let metric_families = registry.gather();
+    debug!(
+        "registry.gather() returned {} metric families",
+        metric_families.len()
+    );
+
     use std::io::Write;
 
-    let encoder = TextEncoder::new();
-    let metric_families = registry.gather();
     let mut response_buffer = Vec::new();
+    let encoder = TextEncoder::new();
     encoder.encode(&metric_families, &mut response_buffer)?;
+    debug!("response_buffer length: {}", response_buffer.len());
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
         response_buffer.len(),

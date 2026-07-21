@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
+use log::debug;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -14,14 +15,16 @@ fn default_true() -> bool {
     true
 }
 
+fn default_programs() -> Vec<EbpfProgramConfig> {
+    Vec::new() // Empty list means enable all registered programs
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
     pub pid_file: String,
     pub working_directory: String,
-    pub user: String,
-    pub group: String,
     pub log_file: String,
-    #[serde(default)]
+    #[serde(default = "default_programs")]
     pub ebpf_programs: Vec<EbpfProgramConfig>,
 }
 
@@ -30,18 +33,14 @@ impl Default for DaemonConfig {
         Self {
             pid_file: "/tmp/bpfagent.pid".to_string(),
             working_directory: "/".to_string(),
-            user: "root".to_string(),
-            group: "root".to_string(),
             log_file: "/tmp/bpfagent.log".to_string(),
-            ebpf_programs: Vec::new(),
+            ebpf_programs: default_programs(),
         }
     }
 }
 
 impl DaemonConfig {
     pub fn load(custom_config: Option<String>) -> Result<Self, anyhow::Error> {
-        let mut config = Self::default();
-
         // If custom config file is provided, use it
         if let Some(config_path) = custom_config {
             let path = Path::new(&config_path);
@@ -67,57 +66,32 @@ impl DaemonConfig {
             config_paths.push(home_path.join(".config/bpfagent/config.toml"));
         }
 
+        // Also check the current directory (for development)
+        if let Ok(cwd) = std::env::current_dir() {
+            config_paths.push(cwd.join("bpfagent.conf"));
+        }
+
         for config_path in &config_paths {
             if config_path.exists() {
-                config = Self::load_from_path(config_path)?;
-                break;
+                debug!("Loading config from: {}", config_path.display());
+                return Self::load_from_path(config_path);
             }
         }
 
-        Ok(config)
+        debug!("No config file found, using defaults");
+        Ok(Self::default())
     }
 
     fn load_from_path(path: &Path) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow!("failed to read config file {}: {}", path.display(), e))?;
 
+        log::debug!("Config file content length: {}", content.len());
+        log::debug!("Config file content bytes: {:?}", content.as_bytes());
+
         let config: Self = toml::from_str(&content)
             .map_err(|e| anyhow!("failed to parse config file {}: {}", path.display(), e))?;
 
         Ok(config)
-    }
-
-    /// Check if a specific EBPF program is enabled
-    pub fn is_program_enabled(&self, program_name: &str) -> bool {
-        if self.ebpf_programs.is_empty() {
-            // If no programs are specified in config, enable all
-            return true;
-        }
-        for program in &self.ebpf_programs {
-            if program.name == program_name {
-                return program.enabled;
-            }
-        }
-        // If program is not in config but other programs are listed, disable it
-        false
-    }
-
-    /// Get list of enabled program names
-    pub fn enabled_program_names(&self) -> Vec<String> {
-        if self.ebpf_programs.is_empty() {
-            // If no programs are specified in config, return empty (all enabled)
-            // We'll use this to detect if config has explicit programs
-            return vec![];
-        }
-        self.ebpf_programs
-            .iter()
-            .filter(|p| p.enabled)
-            .map(|p| p.name.clone())
-            .collect()
-    }
-
-    /// Check if config has explicit program specifications
-    pub fn has_explicit_programs(&self) -> bool {
-        !self.ebpf_programs.is_empty()
     }
 }

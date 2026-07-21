@@ -1,26 +1,23 @@
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
-use aya::{
-    Ebpf,
-    maps::{HashMap, MapData},
-    programs::TracePoint,
-};
-use kfree_skb_common::{SkbDropReason, reason_name};
+use aya::{maps::HashMap, programs::TracePoint, Ebpf};
+use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
 use prometheus::{IntCounterVec, Registry};
 
-use crate::program::EbpfProgram;
+use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Prometheus metrics for kfree_skb
+#[derive(Clone)]
 pub struct Metrics {
     pub total_drops: IntCounterVec,
     pub drops_by_reason: IntCounterVec,
 }
 
 impl Metrics {
-    pub fn new(registry: &Registry) -> Self {
+    pub fn new(registry: Arc<prometheus::Registry>) -> Self {
         let total_drops = IntCounterVec::new(
-            prometheus::opts!["kfree_skb_total_drops", "Total number of SKB drops"],
+            prometheus::opts!("kfree_skb_total_drops", "Total number of SKB drops"),
             &["reason"],
         )
         .expect("failed to create total_drops counter");
@@ -29,7 +26,7 @@ impl Metrics {
             .expect("failed to register total_drops counter");
 
         let drops_by_reason = IntCounterVec::new(
-            prometheus::opts!["kfree_skb_drops_by_reason", "Number of drops by reason"],
+            prometheus::opts!("kfree_skb_drops_by_reason", "Number of drops by reason"),
             &["reason_code", "reason_name"],
         )
         .expect("failed to create drops_by_reason counter");
@@ -44,71 +41,26 @@ impl Metrics {
     }
 }
 
-pub fn display_drop_counts(
-    drop_counts: &mut HashMap<&mut MapData, u32, u64>,
-    metrics: &Metrics,
-) -> anyhow::Result<()> {
-    // Collect all entries from the map
-    let mut all_counts = Vec::new();
-    for entry in drop_counts.iter() {
-        let (reason, count) = entry?;
-        let reason_name = reason_name(SkbDropReason::from(reason));
-        all_counts.push((reason, reason_name, count));
-    }
-
-    // Sort by count (descending)
-    all_counts.sort_by(|a, b| b.2.cmp(&a.2));
-
-    if all_counts.is_empty() {
-        trace!("No drops recorded yet");
-    } else {
-        let total: u64 = all_counts.iter().map(|(_, _, c)| *c).sum();
-        metrics
-            .total_drops
-            .with_label_values(&["all"])
-            .inc_by(total);
-
-        info!("Drop counts (total: {}):", total);
-        for (reason, name, count) in &all_counts {
-            info!("  {:3} ({:30}): {}", reason, name, count);
-            // Update Prometheus metrics
-            metrics
-                .drops_by_reason
-                .with_label_values(&[&reason.to_string(), name])
-                .inc_by(*count);
-        }
-    }
-
-    Ok(())
-}
-
 /// BPF program wrapper for kfree_skb
 pub struct KfreeSkbProgram {
-    pub name: String,
-    pub enabled: bool,
-    pub ebpf: Option<Ebpf>,
+    name: String,
+    ebpf: Option<Ebpf>,
+    metrics: Option<Metrics>,
 }
 
 impl KfreeSkbProgram {
+    /// Creates a new kfree_skb BPF program
     pub fn new() -> Self {
         Self {
             name: "kfree_skb".to_string(),
-            enabled: true,
             ebpf: None,
+            metrics: None,
         }
     }
 
-    /// Get the BPF program map for accessing DROP_COUNTS
-    pub fn get_drop_counts_map(&mut self) -> Option<aya::maps::HashMap<&mut MapData, u32, u64>> {
-        let ebpf = self.ebpf.as_mut()?;
-        aya::maps::HashMap::<&mut MapData, u32, u64>::try_from(ebpf.map_mut("DROP_COUNTS").unwrap())
-            .ok()
-    }
-}
-
-impl Default for KfreeSkbProgram {
-    fn default() -> Self {
-        Self::new()
+    /// Set the Prometheus metrics for this program (internal method)
+    fn set_metrics(&mut self, metrics: Metrics) {
+        self.metrics = Some(metrics);
     }
 }
 
@@ -117,8 +69,8 @@ impl EbpfProgram for KfreeSkbProgram {
         &self.name
     }
 
-    fn enabled(&self) -> bool {
-        self.enabled
+    fn bpf_program_name(&self) -> &str {
+        "kfree_skb"
     }
 
     fn load(&mut self) -> Result<(), anyhow::Error> {
@@ -130,7 +82,13 @@ impl EbpfProgram for KfreeSkbProgram {
         )))?;
 
         // Get the BPF program and map
-        let program: &mut TracePoint = ebpf.program_mut("kfree_skb").unwrap().try_into()?;
+        let program: &mut TracePoint = ebpf
+            .program_mut("kfree_skb")
+            .ok_or_else(|| anyhow::anyhow!("program 'kfree_skb' not found"))
+            .and_then(|p| {
+                p.try_into()
+                    .map_err(|e| anyhow::anyhow!("failed to convert to TracePoint: {}", e))
+            })?;
         program.load()?;
         program.attach("skb", "kfree_skb")?;
 
@@ -147,4 +105,83 @@ impl EbpfProgram for KfreeSkbProgram {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    fn supports_metrics(&self) -> bool {
+        true
+    }
+
+    fn as_metrics_mut(&mut self) -> Option<&mut dyn MetricsDisplay> {
+        Some(self)
+    }
+}
+
+impl MetricsDisplay for KfreeSkbProgram {
+    fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
+        let metrics = Metrics::new(registry);
+        self.set_metrics(metrics);
+        Ok(())
+    }
+
+    fn display_metrics(&mut self) -> anyhow::Result<()> {
+        // Get metrics or return early if not set
+        let metrics = self
+            .metrics
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("metrics not set for kfree_skb program"))?;
+
+        // Get the drop counts map from the BPF program
+        let ebpf = self
+            .ebpf
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("BPF program not loaded"))?;
+        let map = ebpf
+            .map_mut("DROP_COUNTS")
+            .ok_or_else(|| anyhow::anyhow!("DROP_COUNTS map not found"))?;
+        let drop_counts = HashMap::<_, u32, u64>::try_from(map)
+            .map_err(|_| anyhow::anyhow!("failed to get DROP_COUNTS map"))?;
+
+        // Collect all entries from the map
+        let mut all_counts = Vec::new();
+        for entry in drop_counts.iter() {
+            let (reason, count) = entry?;
+            let reason_name = reason_name(SkbDropReason::from(reason));
+            all_counts.push((reason, reason_name, count));
+        }
+
+        // Sort by count (descending)
+        all_counts.sort_by_key(|b| std::cmp::Reverse(b.2));
+
+        if all_counts.is_empty() {
+            trace!("No drops recorded yet");
+        } else {
+            let total: u64 = all_counts.iter().map(|(_, _, c)| *c).sum();
+            metrics
+                .total_drops
+                .with_label_values(&["all"])
+                .inc_by(total);
+
+            info!("Drop counts (total: {}):", total);
+            for (reason, name, count) in &all_counts {
+                info!("  {:3} ({:30}): {}", reason, name, count);
+                // Update Prometheus metrics
+                metrics
+                    .drops_by_reason
+                    .with_label_values(&[&reason.to_string(), name])
+                    .inc_by(*count);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for KfreeSkbProgram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Initialize this program by registering it with the registry
+pub fn init(registry: &mut ProgramRegistry) {
+    registry.register("kfree_skb", || Box::new(KfreeSkbProgram::new()));
 }

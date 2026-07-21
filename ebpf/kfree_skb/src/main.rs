@@ -5,10 +5,10 @@
  * All rights reserved.
  */
 use aya_ebpf::{
-    EbpfContext,
     macros::{map, tracepoint},
     maps::HashMap,
     programs::TracePointContext,
+    EbpfContext,
 };
 use aya_log_ebpf::debug;
 use kfree_skb_common::SkbDropReason;
