@@ -1,21 +1,53 @@
 # BPF Agent
 
-A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. Currently includes the `kfree_skb` program that traces kernel packet drops.
+A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. It includes the `kfree_skb` program that traces kernel packet drops.
 
 ## Overview
 
 This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statistics on why network packets are being dropped. It provides real-time visibility into network stack issues by tracking drop reasons defined in the kernel's `enum skb_drop_reason`.
 
+## Configuration
+
+The application uses a TOML configuration file to control daemon settings and which eBPF programs to load.
+
+### Config File Format
+
+```toml
+# Daemon settings
+pid_file = "/tmp/bpfagent.pid"
+working_directory = "/"
+log_file = "/tmp/bpfagent.log"
+
+# EBPF programs to load and run
+[[ebpf_programs]]
+name = "kfree_skb"
+enabled = true
+```
+
+### Config File Locations
+
+By default, the application searches for the config file in these locations:
+- `/etc/bpfagent.conf`
+- `/etc/bpfagent/bpfagent.conf`
+- `/usr/local/etc/bpfagent.conf`
+- `/usr/local/etc/bpfagent/bpfagent.conf`
+- `~/.bpfagent.conf` (if HOME is set)
+- `~/.config/bpfagent/config.toml` (if HOME is set)
+- `./bpfagent.conf` (current directory for development)
+
+Use the `-f/--config-file` option to specify a custom config file path.
+
 ## Features
 
 - **Modular architecture** - easy to add new eBPF programs via separate modules
+- **Configurable program loading** - load specific programs from config file
 - **kfree_skb program** - traces packet drops at the kernel's `kfree_skb` tracepoint
 - Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
 - Displays drop statistics every 3 seconds
 - Uses BPF CO-RE compatible types via Aya framework
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
-- **Clean code organization** - separates concerns into modules (common, kfree_skb, metrics)
+- **Clean code organization** - separates concerns into modules (common, config, kfree_skb, metrics)
 
 ## Prerequisites
 
@@ -46,21 +78,21 @@ The application supports two running modes:
 **Daemon Mode (default)**
 - Runs in the background without stdout output
 - Only Prometheus metrics endpoint provides feedback
-- Use `--daemon=false` to disable or `--verbose` for logging
+- Use `-d` to enable (default) or `--daemon=false` to disable
 
 **Interactive Mode**
 - Displays drop statistics to stdout every 3 seconds
 - Use `--daemon=false` to enable interactive mode
 - Use `--verbose` to enable verbose logging in daemon mode
 
-The metrics server listens on port **9101** by default (changeable with `--metrics-port`).
+The metrics server listens on port **9101** by default (changeable with `-p`).
 
 ```bash
 # Build in release mode
 cargo build --release
 
 # Run with sudo (required for eBPF)
-sudo cargo run --release
+sudo cargo run --release -- -f /etc/bpfagent.conf
 ```
 
 ### Command-line Options
@@ -71,12 +103,16 @@ sudo cargo run --release
 | `-i, --metrics-ip` | | `0.0.0.0` | Metrics server IP address |
 | `-p, --metrics-port` | | `9101` | Metrics server port |
 | `-v, --verbose` | | | Enable verbose output (overrides daemon mode for interactive debugging) |
+| `-f, --config-file` | | | Path to config file (overrides default config file paths) |
 
 **Examples:**
 
 ```bash
-# Default: run in daemon mode (background, no stdout)
+# Default: run in daemon mode with default config paths
 sudo cargo run --release
+
+# Run with custom config file
+sudo cargo run --release -- -f /path/to/bpfagent.conf
 
 # Run in interactive mode with stdout output
 sudo cargo run --release -- --daemon=false
@@ -91,7 +127,7 @@ sudo cargo run --release -- --metrics-ip 127.0.0.1
 sudo cargo run --release -- --metrics-port 8080
 
 # Use custom IP and port (short forms)
-sudo cargo run --release -- -i 0.0.0.0 -p 9999
+sudo cargo run --release -- -i 127.0.0.1 -p 9999
 ```
 
 ### Check for errors without running
@@ -207,8 +243,10 @@ bpfagent/
 │   └── src/
 │       ├── main.rs     # Application entry point with argument parsing
 │       ├── common.rs   # Shared CLI arguments for bpfagent
+│       ├── config.rs   # Config file parsing and daemon settings
 │       ├── kfree_skb.rs# kfree_skb-specific logic (metrics, display)
-│       └── metrics.rs  # Prometheus metrics HTTP server
+│       ├── metrics.rs  # Prometheus metrics HTTP server
+│       └── program.rs  # Generic program traits and registry
 ├── common/
 │   └── kfree_skb/      # Shared types between user and eBPF code
 └── ebpf/
@@ -218,8 +256,10 @@ bpfagent/
 ### Key Files
 
 - `bpfagent/src/main.rs` - Main application entry point with argument parsing
-- `bpfagent/src/common.rs` - Shared CLI arguments (metrics IP/port)
+- `bpfagent/src/common.rs` - Shared CLI arguments (metrics IP/port, config file path)
+- `bpfagent/src/config.rs` - Config file parsing and daemon settings
 - `bpfagent/src/kfree_skb.rs` - kfree_skb-specific logic (metrics, display functions)
 - `bpfagent/src/metrics.rs` - Prometheus metrics HTTP server
+- `bpfagent/src/program.rs` - Generic program traits and registry for adding new programs
 - `ebpf/kfree_skb/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
 - `common/kfree_skb/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)
