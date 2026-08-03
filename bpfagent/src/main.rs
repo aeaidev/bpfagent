@@ -3,6 +3,7 @@ mod config;
 mod kfree_skb;
 mod metrics;
 mod program;
+mod sca;
 
 use std::{collections::HashMap, fs::File, os::unix::io::AsRawFd, sync::Arc};
 
@@ -24,6 +25,7 @@ fn register_programs() -> ProgramRegistry {
     // Initialize all program modules - each module registers itself
     // To add a new program, add its module and call its init function here
     kfree_skb::init(&mut registry);
+    sca::init(&mut registry);
 
     registry
 }

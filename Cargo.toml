@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "bpfagent",
     "common/kfree_skb",
+    "common/sca",
     "ebpf/kfree_skb",
+    "ebpf/sca",
 ]
-default-members = ["bpfagent", "common/kfree_skb"]
+default-members = ["bpfagent", "common/kfree_skb", "common/sca"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

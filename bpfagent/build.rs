@@ -6,22 +6,38 @@ fn main() -> anyhow::Result<()> {
         .no_deps()
         .exec()
         .context("MetadataCommand::exec")?;
-    let ebpf_package = packages
-        .into_iter()
-        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "kfree_skb-ebpf")
-        .ok_or_else(|| anyhow!("kfree_skb-ebpf package not found"))?;
-    let cargo_metadata::Package {
-        name,
-        manifest_path,
-        ..
-    } = ebpf_package;
-    let ebpf_package = aya_build::Package {
-        name: name.as_str(),
-        root_dir: manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
-            .as_str(),
-        ..Default::default()
-    };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+
+    // Build both kfree_skb and SCA eBPF packages
+    let mut ebpf_packages = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut root_dirs: Vec<String> = Vec::new();
+
+    for package in packages {
+        let name = package.name.clone();
+        match name.as_str() {
+            "kfree_skb-ebpf" | "sca-ebpf" => {
+                names.push(name.to_string());
+                let manifest_path = package.manifest_path.clone();
+                let root_dir = manifest_path
+                    .parent()
+                    .ok_or_else(|| anyhow!("no parent for manifest"))?
+                    .to_string();
+                root_dirs.push(root_dir);
+            }
+            _ => {}
+        }
+    }
+
+    for (name, root_dir) in names.iter().zip(root_dirs.iter()) {
+        ebpf_packages.push(aya_build::Package {
+            name: name.as_str(),
+            root_dir: root_dir.as_str(),
+            ..Default::default()
+        });
+    }
+
+    if ebpf_packages.is_empty() {
+        return Err(anyhow!("No eBPF packages found"));
+    }
+    aya_build::build_ebpf(ebpf_packages, Toolchain::default())
 }
