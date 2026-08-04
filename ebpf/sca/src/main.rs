@@ -2,9 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user_buf,
-    },
+    helpers::{bpf_get_current_comm, bpf_ktime_get_ns, bpf_probe_read_user_buf},
     macros::{map, tracepoint},
     maps::HashMap,
     programs::TracePointContext,
@@ -21,9 +19,16 @@ pub static SOCKET_FD_MAP: HashMap<u32, u8> =
 #[map]
 pub static BUFFER_HASH: HashMap<u32, u64> = HashMap::with_max_entries(1024, 0);
 
-/// Max latency per PID (PID -> max latency in ns)
+/// Max latency per process name (process name -> max latency in ns)
 #[map]
-pub static LATENCY_PID_HASH: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
+pub static LATENCY_PNAME_HASH: HashMap<[u8; 16], u64> = HashMap::with_max_entries(16, 0);
+
+/// Timestamp of last reset for each process name (process name -> timestamp in ns)
+#[map]
+pub static LATENCY_RESET_TIME: HashMap<[u8; 16], u64> = HashMap::with_max_entries(16, 0);
+
+/// 2 seconds in nanoseconds
+const RESET_INTERVAL_NS: u64 = 20_000_000_000;
 
 /// Process names map for filtering
 #[map]
@@ -206,37 +211,52 @@ fn mesure_packet_duration(ctx: &TracePointContext, buf: &[u8; 4], fd: u32) {
                 let diff = timestamp - existing_timestamp;
                 debug!(ctx, "mesure_packet_duration: diff={}", diff);
 
-                // Get PID for logging and latency tracking
-                let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-                debug!(ctx, "mesure_packet_duration: pid={}", pid);
+                // Get process name for logging and latency tracking
+                let comm = bpf_get_current_comm().unwrap_or_default();
+                let mut pname_key: [u8; 16] = [0; 16];
+                let len = comm.len().min(16);
+                pname_key[0..len].copy_from_slice(&comm[0..len]);
 
-                // Update max latency for this PID
-                debug!(ctx, "Updating PID {} with diff {} ns", pid, diff);
-                debug!(ctx, "LATENCY_PID_HASH insert: pid={}, diff={}", pid, diff);
-                match LATENCY_PID_HASH.get(&pid) {
+                // Check if we need to reset latency for this process name (every 2 seconds)
+                let current_time = bpf_ktime_get_ns();
+                match LATENCY_RESET_TIME.get(&pname_key) {
+                    Some(last_reset_time) => {
+                        if current_time - *last_reset_time > RESET_INTERVAL_NS {
+                            // Reset the latency hash entry and reset time
+                            LATENCY_PNAME_HASH.insert(&pname_key, &0, 0).ok();
+                            LATENCY_RESET_TIME.insert(&pname_key, &current_time, 0).ok();
+                            debug!(ctx, "Reset latency for process at time {}", current_time);
+                        }
+                    }
+                    None => {
+                        // First time seeing this process, set reset time
+                        LATENCY_RESET_TIME.insert(&pname_key, &current_time, 0).ok();
+                    }
+                }
+
+                // Update max latency for this process
+                debug!(ctx, "LATENCY_PNAME_HASH insert: diff={}", diff);
+                match LATENCY_PNAME_HASH.get(&pname_key) {
                     Some(max_latency) => {
                         if diff > *max_latency {
-                            LATENCY_PID_HASH.insert(&pid, &diff, 0).ok();
-                            debug!(ctx, "Updated max latency for PID {} to {} ns", pid, diff);
+                            LATENCY_PNAME_HASH.insert(&pname_key, &diff, 0).ok();
+                            debug!(ctx, "Updated max latency to {} ns", diff);
                         } else {
                             debug!(
                                 ctx,
-                                "PID {} existing max {} ns > new diff {} ns",
-                                pid,
-                                *max_latency,
-                                diff
+                                "Process existing max {} ns > new diff {} ns", *max_latency, diff
                             );
                         }
                     }
                     None => {
-                        LATENCY_PID_HASH.insert(&pid, &diff, 0).ok();
-                        debug!(ctx, "Inserted new entry for PID {} with {} ns", pid, diff);
+                        LATENCY_PNAME_HASH.insert(&pname_key, &diff, 0).ok();
+                        debug!(ctx, "Inserted new entry with {} ns", diff);
                     }
                 }
 
                 debug!(
                     ctx,
-                    "packet [pid={}] [fd={}] [data={:x}...] duration: {} ns", pid, fd, key, diff
+                    "packet [fd={}] [data={:x}...] duration: {} ns", fd, key, diff
                 );
                 // Remove the key from HashMap
                 match BUFFER_HASH.remove(&key) {
