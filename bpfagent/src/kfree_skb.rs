@@ -3,21 +3,20 @@ use std::{any::Any, sync::Arc};
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
-use prometheus::{IntCounterVec, Registry};
+use prometheus::{IntCounterVec, Opts, Registry};
 
 use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
 
-/// Prometheus metrics for kfree_skb
-#[derive(Clone)]
-pub struct Metrics {
+/// Prometheus metrics for KfreeSkb program
+pub struct KfreeSkbMetrics {
     pub total_drops: IntCounterVec,
     pub drops_by_reason: IntCounterVec,
 }
 
-impl Metrics {
-    pub fn new(registry: Arc<prometheus::Registry>) -> Self {
+impl KfreeSkbMetrics {
+    pub fn new(registry: Arc<Registry>) -> Self {
         let total_drops = IntCounterVec::new(
-            prometheus::opts!("kfree_skb_total_drops", "Total number of SKB drops"),
+            Opts::new("kfree_skb_total_drops", "Total number of dropped packets"),
             &["reason"],
         )
         .expect("failed to create total_drops counter");
@@ -26,7 +25,10 @@ impl Metrics {
             .expect("failed to register total_drops counter");
 
         let drops_by_reason = IntCounterVec::new(
-            prometheus::opts!("kfree_skb_drops_by_reason", "Number of drops by reason"),
+            Opts::new(
+                "kfree_skb_drops_by_reason",
+                "Number of dropped packets by reason",
+            ),
             &["reason_code", "reason_name"],
         )
         .expect("failed to create drops_by_reason counter");
@@ -45,7 +47,7 @@ impl Metrics {
 pub struct KfreeSkbProgram {
     name: String,
     ebpf: Option<Ebpf>,
-    metrics: Option<Metrics>,
+    metrics: Option<KfreeSkbMetrics>,
 }
 
 impl KfreeSkbProgram {
@@ -59,7 +61,7 @@ impl KfreeSkbProgram {
     }
 
     /// Set the Prometheus metrics for this program (internal method)
-    fn set_metrics(&mut self, metrics: Metrics) {
+    fn set_metrics(&mut self, metrics: KfreeSkbMetrics) {
         self.metrics = Some(metrics);
     }
 }
@@ -117,7 +119,7 @@ impl EbpfProgram for KfreeSkbProgram {
 
 impl MetricsDisplay for KfreeSkbProgram {
     fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
-        let metrics = Metrics::new(registry);
+        let metrics = KfreeSkbMetrics::new(registry);
         self.set_metrics(metrics);
         Ok(())
     }
@@ -166,7 +168,7 @@ impl MetricsDisplay for KfreeSkbProgram {
                 // Update Prometheus metrics
                 metrics
                     .drops_by_reason
-                    .with_label_values(&[&reason.to_string(), name])
+                    .with_label_values(&[&reason.to_string(), &name.to_string()])
                     .inc_by(*count);
             }
         }

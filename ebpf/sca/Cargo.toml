@@ -1,0 +1,17 @@
+[package]
+name = "sca-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+sca-common = { path = "../../common/sca" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "sca"
+path = "src/main.rs"

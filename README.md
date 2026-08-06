@@ -1,10 +1,19 @@
 # BPF Agent
 
-A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. It includes the `kfree_skb` program that traces kernel packet drops.
+A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. It includes:
+
+- **kfree_skb** - traces kernel packet drops
+- **SCA (Socket Communication Analyzer)** - traces socket communication latency per process
 
 ## Overview
 
+### kfree_skb Program
+
 This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statistics on why network packets are being dropped. It provides real-time visibility into network stack issues by tracking drop reasons defined in the kernel's `enum skb_drop_reason`.
+
+### SCA Program
+
+The SCA program traces socket communication latency by measuring packet duration between first and second occurrence of the same buffer content. It tracks the maximum latency per process name and exports metrics via Prometheus.
 
 ## Configuration
 
@@ -21,6 +30,10 @@ log_file = "/tmp/bpfagent.log"
 # EBPF programs to load and run
 [[ebpf_programs]]
 name = "kfree_skb"
+enabled = true
+
+[[ebpf_programs]]
+name = "sca"
 enabled = true
 ```
 
@@ -42,12 +55,17 @@ Use the `-f/--config-file` option to specify a custom config file path.
 - **Modular architecture** - easy to add new eBPF programs via separate modules
 - **Configurable program loading** - load specific programs from config file
 - **kfree_skb program** - traces packet drops at the kernel's `kfree_skb` tracepoint
-- Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
-- Displays drop statistics every 3 seconds
-- Uses BPF CO-RE compatible types via Aya framework
+  - Counts drops by reason (e.g., `TCP_CSUM`, `NO_SOCKET`, `QDISC_DROP`, etc.)
+  - Displays drop statistics every 3 seconds
+  - Uses BPF CO-RE compatible types via Aya framework
+- **SCA program** - traces socket communication latency per process
+  - Measures packet duration between first and second occurrence
+  - Tracks maximum latency per process name
+  - Resets latency values every 2 seconds
+  - Exports metrics via Prometheus with process name labels
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
-- **Clean code organization** - separates concerns into modules (common, config, kfree_skb, metrics)
+- **Clean code organization** - separates concerns into modules (common, config, programs, metrics)
 
 ## Prerequisites
 
@@ -64,7 +82,8 @@ Use the `-f/--config-file` option to specify a custom config file path.
 
 3. **Linux kernel** with:
    - BPF support (CONFIG_BPF=y)
-   - Tracepoint support for `skb:kfree_skb`
+   - Tracepoint support for `skb:kfree_skb` (for kfree_skb program)
+   - Tracepoint support for `syscalls:sys_enter_sendmsg`, `syscalls:sys_enter_write`, etc. (for SCA program)
    - BTF debug info (CONFIG_DEBUG_INFO_BTF=y) - for best compatibility
 
 ## Build & Run
@@ -81,7 +100,9 @@ The application supports two running modes:
 - Use `-d` to enable (default) or `--daemon=false` to disable
 
 **Interactive Mode**
-- Displays drop statistics to stdout every 3 seconds
+- Displays statistics to stdout every 3 seconds
+  - For kfree_skb: drop counts by reason
+  - For SCA: max latency per process name
 - Use `--daemon=false` to enable interactive mode
 - Use `--verbose` to enable verbose logging in daemon mode
 
@@ -194,25 +215,46 @@ scrape_configs:
 
 ### Available Metrics
 
+#### kfree_skb Metrics
+
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `kfree_skb_total_drops` | Counter | `reason` | Total number of SKB drops |
 | `kfree_skb_drops_by_reason` | Counter | `reason_code`, `reason_name` | Number of drops by reason |
 
+#### SCA Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `sca_max_latency_per_pname` | Gauge | `pname` | Maximum latency in microseconds per process name |
+
 ### Metrics Output Example
+
+#### kfree_skb
 
 ```
 # HELP kfree_skb_total_drops Total number of SKB drops
 # TYPE kfree_skb_total_drops counter
-kfree_skb_total_drops{reason="all"} 1234
+ kotlinx_skb_total_drops{reason="all"} 1234
 # HELP kfree_skb_drops_by_reason Number of drops by reason
 # TYPE kfree_skb_drops_by_reason counter
-kfree_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
-kfree_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
-kfree_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
+ kotlinx_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
+ kotlinx_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
+ kotlinx_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
+```
+
+#### SCA
+
+```
+# HELP sca_max_latency_per_pname Maximum latency in microseconds per process name
+# TYPE sca_max_latency_per_pname gauge
+ sca_max_latency_per_pname{pname="INTERNAL_ROUTER"} 150
+ sca_max_latency_per_pname{pname="FRAGMENTER"} 280
 ```
 
 ## Output Example
+
+### kfree_skb Output
 
 ```
 Drop counts (total: 1234):
@@ -220,6 +262,14 @@ Drop counts (total: 1234):
   64 (QDISC_DROP             ): 321
    3 (NO_SOCKET              ): 234
   55 (BPF_CGROUP_EGRESS      ): 123
+```
+
+### SCA Output
+
+```
+--- Max Latency per Process Name ---
+  INTERNAL_ROUTER: 150 us
+  FRAGMENTER: 280 us
 ```
 
 ## Mapping Drop Reasons
@@ -245,21 +295,27 @@ bpfagent/
 │       ├── common.rs   # Shared CLI arguments for bpfagent
 │       ├── config.rs   # Config file parsing and daemon settings
 │       ├── kfree_skb.rs# kfree_skb-specific logic (metrics, display)
+│       ├── sca.rs      # SCA-specific logic (metrics, display)
 │       ├── metrics.rs  # Prometheus metrics HTTP server
 │       └── program.rs  # Generic program traits and registry
 ├── common/
-│   └── kfree_skb/      # Shared types between user and eBPF code
+│   ├── kfree_skb/      # Shared types between user and eBPF code
+│   └── sca/            # Shared types between user and eBPF code
 └── ebpf/
-    └── kfree_skb/      # Kernel-space eBPF program source
+    ├── kfree_skb/      # Kernel-space eBPF program source
+    └── sca/            # Kernel-space eBPF program source
 ```
 
 ### Key Files
 
-- `bpfagent/src/main.rs` - Main application entry point with argument parsing
-- `bpfagent/src/common.rs` - Shared CLI arguments (metrics IP/port, config file path)
-- `bpfagent/src/config.rs` - Config file parsing and daemon settings
+#### kfree_skb
+
 - `bpfagent/src/kfree_skb.rs` - kfree_skb-specific logic (metrics, display functions)
-- `bpfagent/src/metrics.rs` - Prometheus metrics HTTP server
-- `bpfagent/src/program.rs` - Generic program traits and registry for adding new programs
 - `ebpf/kfree_skb/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
 - `common/kfree_skb/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)
+
+#### SCA
+
+- `bpfagent/src/sca.rs` - SCA-specific logic (metrics, display functions)
+- `ebpf/sca/src/main.rs` - eBPF program attached to tracepoints for send/recv syscalls
+- `common/sca/src/lib.rs` - Common types (process names, socket paths, tracepoints)
