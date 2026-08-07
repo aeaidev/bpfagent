@@ -51,3 +51,16 @@ flowchart TD
 - All socket paths use Unix domain sockets
 - Data flows through multiple processes via intermediate sockets
 - SCA (System Communication Analyzer) traces traffic on these sockets
+
+
+## Taking the latancy based on NNG packet REQ/REP timestamp difference
+
+The data are sent in the following packet NNG/SCA format:
+
+| NNG SPF  | Protocol (REQ/REP) | MSG Type  | Size | Payload |
+|----------|--------------------|-----------|------|---------|
+|    9B    |        4B          |    2B     |  2B  |         |
+
+where we skip the first 9 bytes and focus on the protocol REQ/REP 4 bytes and the MSG Type 2 bytes.
+On the receiving we map a key made of the combined Protocol (REQ/REP) and MSG Type to its timestamp value.
+Then on sending back over the same socket we check the map with combined key of Protocol (REQ/REP) and MSG Type + 1 field and tame thier timestamps difference as a latancy for process id

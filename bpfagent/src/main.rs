@@ -15,6 +15,9 @@ use prometheus::Registry;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+use aya_log::EbpfLogger;
+use tokio::io::unix::AsyncFd;
+
 use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Register all available EBPF programs
@@ -183,6 +186,53 @@ fn main() -> anyhow::Result<()> {
         for (name, program) in &mut programs {
             info!("Loading program: {}", name);
             program.load()?;
+        }
+
+        // Initialize EbpfLogger to capture eBPF debug output
+        // This must be done after programs are loaded to have access to their maps
+        // We need to spawn a tokio task to continuously read from the debug ring
+        for (name, program) in &mut programs {
+            debug!("Initializing EbpfLogger for program: {}", name);
+            // Get the underlying Ebpf instance to initialize the logger
+            if let Some(ebpf) = program.ebpf_mut() {
+                match EbpfLogger::init(ebpf) {
+                    Ok(logger) => {
+                        debug!("EbpfLogger initialized for program {}", name);
+
+                        // Spawn a tokio task to continuously flush the logger
+                        tokio::task::spawn(async move {
+                            match AsyncFd::with_interest(logger, tokio::io::Interest::READABLE) {
+                                Ok(mut logger) => loop {
+                                    match logger.readable_mut().await {
+                                        Ok(mut guard) => {
+                                            guard.get_inner_mut().flush();
+                                            guard.clear_ready();
+                                        }
+                                        Err(e) => {
+                                            debug!("AsyncFd readable error: {}", e);
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ))
+                                            .await;
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    debug!("Failed to create AsyncFd for logger: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Failed to initialize EbpfLogger for program {}: {}",
+                            name, e
+                        );
+                    }
+                }
+            } else {
+                debug!("No Ebpf instance for program {}", name);
+            }
         }
 
         // Start all enabled programs

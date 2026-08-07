@@ -5,7 +5,7 @@ use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
 use prometheus::{IntCounterVec, Opts, Registry};
 
-use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
+use crate::program::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Prometheus metrics for KfreeSkb program
 pub struct KfreeSkbMetrics {
@@ -180,6 +180,12 @@ impl MetricsDisplay for KfreeSkbProgram {
 impl Default for KfreeSkbProgram {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl EbpfAccess for KfreeSkbProgram {
+    fn ebpf_mut(&mut self) -> Option<&mut Ebpf> {
+        self.ebpf.as_mut()
     }
 }
 

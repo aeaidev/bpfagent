@@ -4,7 +4,7 @@ use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use log::{debug, info, warn};
 use prometheus::{IntGaugeVec, Opts, Registry};
 
-use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
+use crate::program::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Prometheus metrics for SCA program
 pub struct ScaMetrics {
@@ -71,6 +71,8 @@ impl EbpfProgram for ScaProgram {
             "/sca"
         )))?;
 
+        debug!("Loaded BPF program, attaching tracepoints...");
+
         // Load and attach tracepoints
         for (name, category, event) in sca_common::TRACEPOINTS {
             let program: &mut TracePoint = ebpf
@@ -81,6 +83,8 @@ impl EbpfProgram for ScaProgram {
             program.attach(category, event)?;
             debug!("Attached tracepoint {}:{}:{}", name, category, event);
         }
+
+        debug!("All tracepoints attached successfully");
 
         // Initialize process names map
         populate_process_names_map(&mut ebpf, sca_common::PROCESS_NAMES)?;
@@ -175,6 +179,12 @@ impl Default for ScaProgram {
     }
 }
 
+impl EbpfAccess for ScaProgram {
+    fn ebpf_mut(&mut self) -> Option<&mut Ebpf> {
+        self.ebpf.as_mut()
+    }
+}
+
 /// Initialize this program by registering it with the registry
 pub fn init(registry: &mut ProgramRegistry) {
     registry.register("sca", || Box::new(ScaProgram::new()));
@@ -252,7 +262,7 @@ fn populate_latency_pname_hash(ebpf: &mut Ebpf) -> anyhow::Result<()> {
 }
 
 /**
- * Populate SOCKET_FD_MAP with file descriptors from all Unix sockets
+ * Populate SOCKET_FD_MAP with file descriptors from Unix sockets
  */
 fn populate_socket_fd_map(ebpf: &mut Ebpf, _socket_paths: &[&str]) -> anyhow::Result<()> {
     debug!("Populating SOCKET_FD_MAP with all Unix socket fds from allowed processes");

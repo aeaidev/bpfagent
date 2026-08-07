@@ -13,7 +13,7 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 
 ### SCA Program
 
-The SCA program traces socket communication latency by measuring packet duration between first and second occurrence of the same buffer content. It tracks the maximum latency per process name and exports metrics via Prometheus.
+The SCA program traces socket communication latency by measuring the timestamp difference between NNG protocol messages. It uses a combined key of Protocol (4B) + Message Type (2B) to match REQ/REP message pairs on Unix domain sockets. It tracks the maximum latency per process name and exports metrics via Prometheus.
 
 ## Configuration
 
@@ -59,7 +59,11 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - Displays drop statistics every 3 seconds
   - Uses BPF CO-RE compatible types via Aya framework
 - **SCA program** - traces socket communication latency per process
-  - Measures packet duration between first and second occurrence
+  - Measures latency based on NNG protocol message timestamp differences
+  - Uses combined key of Protocol (4B) + Message Type (2B) to match REQ/REP pairs
+  - On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
+  - On send: looks up timestamp with key = Protocol + MSG_Type
+  - Calculates latency as timestamp difference on match
   - Tracks maximum latency per process name
   - Resets latency values every 2 seconds
   - Exports metrics via Prometheus with process name labels
@@ -226,7 +230,7 @@ scrape_configs:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sca_max_latency_per_pname` | Gauge | `pname` | Maximum latency in microseconds per process name |
+| `sca_max_latency_per_pname` | Gauge | `pname` | Maximum latency in microseconds per process name (based on NNG Protocol + Message Type key timestamp difference) |
 
 ### Metrics Output Example
 
@@ -245,8 +249,14 @@ scrape_configs:
 
 #### SCA
 
+The SCA program calculates latency based on NNG protocol message timestamp differences using a combined key:
+- Key format: Protocol (4B) + Message Type (2B) = 6 bytes combined into u64
+- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
+- On send: looks up timestamp with key = Protocol + MSG_Type
+- Latency is calculated as the timestamp difference on match
+
 ```
-# HELP sca_max_latency_per_pname Maximum latency in microseconds per process name
+# HELP sca_max_latency_per_pname Maximum latency in microseconds per process name (based on NNG Protocol + Message Type timestamp difference)
 # TYPE sca_max_latency_per_pname gauge
  sca_max_latency_per_pname{pname="INTERNAL_ROUTER"} 150
  sca_max_latency_per_pname{pname="FRAGMENTER"} 280
@@ -265,6 +275,11 @@ Drop counts (total: 1234):
 ```
 
 ### SCA Output
+
+The SCA program tracks latency based on NNG Protocol + Message Type key matching:
+- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
+- On send: looks up timestamp with key = Protocol + MSG_Type
+- Latency is calculated as the timestamp difference on match
 
 ```
 --- Max Latency per Process Name ---
@@ -317,5 +332,11 @@ bpfagent/
 #### SCA
 
 - `bpfagent/src/sca.rs` - SCA-specific logic (metrics, display functions)
-- `ebpf/sca/src/main.rs` - eBPF program attached to tracepoints for send/recv syscalls
+- `ebpf/sca/src/main.rs` - eBPF program that matches NNG Protocol + Message Type keys for latency calculation
 - `common/sca/src/lib.rs` - Common types (process names, socket paths, tracepoints)
+
+**SCA Latency Calculation:**
+- Uses combined key of Protocol (4B) + Message Type (2B) to match REQ/REP message pairs
+- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
+- On send: looks up timestamp with key = Protocol + MSG_Type
+- Latency = current_timestamp - stored_timestamp on match

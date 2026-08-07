@@ -1,5 +1,7 @@
 use std::{any::Any, collections::HashMap, sync::Arc};
 
+use aya::Ebpf;
+
 /// Trait for EBPF programs that support metrics display
 pub trait MetricsDisplay {
     /// Set the Prometheus registry for this program
@@ -9,8 +11,14 @@ pub trait MetricsDisplay {
     fn display_metrics(&mut self) -> anyhow::Result<()>;
 }
 
+/// Trait for accessing the underlying Ebpf instance
+pub trait EbpfAccess {
+    /// Get a mutable reference to the underlying Ebpf instance
+    fn ebpf_mut(&mut self) -> Option<&mut Ebpf>;
+}
+
 /// Trait for EBPF programs
-pub trait EbpfProgram {
+pub trait EbpfProgram: EbpfAccess {
     /// Returns the program name (config name)
     #[allow(dead_code)]
     fn name(&self) -> &str {
