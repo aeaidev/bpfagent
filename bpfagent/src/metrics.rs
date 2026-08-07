@@ -1,3 +1,18 @@
+//! Prometheus Metrics HTTP Server
+//!
+//! This module provides a simple HTTP server that exposes eBPF program metrics
+//! in Prometheus text format.
+//!
+//! # Endpoint
+//!
+//! - `GET /metrics` - Returns metrics in Prometheus text format
+//!
+//! # Example
+//!
+//! ```bash
+//! curl http://localhost:9101/metrics
+//! ```
+
 use std::{io::Read, sync::Arc};
 
 use log::debug;

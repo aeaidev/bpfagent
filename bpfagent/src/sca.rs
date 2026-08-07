@@ -1,3 +1,30 @@
+//! SCA (Socket Communication Analyzer) eBPF Program - Socket Latency Tracing
+//!
+//! This module provides a BPF program that traces socket communication latency
+//! by measuring the timestamp difference between NNG protocol messages.
+//!
+//! The eBPF program attaches to various tracepoints (sendmsg, write, etc.) and
+//! uses a combined key of Protocol (4B) + Message Type (2B) to match REQ/REP
+//! message pairs on Unix domain sockets.
+//!
+//! # Latency Calculation
+//!
+//! - On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
+//! - On send: looks up timestamp with key = Protocol + MSG_Type
+//! - Latency is calculated as the timestamp difference on match
+//!
+//! # Prometheus Metrics
+//!
+//! - `sca_max_latency_per_pname`: Maximum latency in microseconds per process name
+//!
+//! # Example Output
+//!
+//! ```text
+//! --- Max Latency per Process Name ---
+//!   INTERNAL_ROUTER: 150 us
+//!   FRAGMENTER: 280 us
+//! ```
+
 use std::{any::Any, sync::Arc};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
@@ -6,13 +33,20 @@ use prometheus::{IntGaugeVec, Opts, Registry};
 
 use crate::program::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
+/// Module re-exports for convenience
+use sca_common;
+
 /// Prometheus metrics for SCA program
 pub struct ScaMetrics {
     pub max_latency_per_pname: IntGaugeVec,
 }
 
 impl ScaMetrics {
-    pub fn new(registry: Arc<Registry>) -> Self {
+    /// Create new SCA Prometheus metrics with proper error handling
+    ///
+    /// # Errors
+    /// Returns error if metric creation or registration fails
+    pub fn new(registry: Arc<Registry>) -> anyhow::Result<Self> {
         let max_latency_per_pname = IntGaugeVec::new(
             Opts::new(
                 "sca_max_latency_per_pname",
@@ -20,14 +54,17 @@ impl ScaMetrics {
             ),
             &["pname"],
         )
-        .expect("failed to create max_latency_per_pname gauge");
+        .map_err(|e| anyhow::anyhow!("failed to create max_latency_per_pname gauge: {}", e))?;
+
         registry
             .register(Box::new(max_latency_per_pname.clone()))
-            .expect("failed to register max_latency_per_pname gauge");
+            .map_err(|e| {
+                anyhow::anyhow!("failed to register max_latency_per_pname gauge: {}", e)
+            })?;
 
-        Self {
+        Ok(Self {
             max_latency_per_pname,
-        }
+        })
     }
 }
 
@@ -120,7 +157,7 @@ impl EbpfProgram for ScaProgram {
 
 impl MetricsDisplay for ScaProgram {
     fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
-        let metrics = ScaMetrics::new(registry);
+        let metrics = ScaMetrics::new(registry)?;
         self.set_metrics(metrics);
         Ok(())
     }

@@ -1,3 +1,9 @@
+//! Common command-line argument definitions
+//!
+//! Provides shared CLI argument parsing for the bpfagent application,
+//! supporting both daemon and interactive modes with configurable
+//! metrics server settings.
+
 use clap::Parser;
 
 /// Common command-line arguments for bpfagent

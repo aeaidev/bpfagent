@@ -1,6 +1,40 @@
+//! Configuration file parsing and daemon settings
+//!
+//! This module handles loading and parsing the TOML configuration file,
+//! which controls daemon behavior and which eBPF programs to load.
+//!
+//! # Configuration File Format
+//!
+//! ```toml
+//! # Daemon settings
+//! pid_file = "/tmp/bpfagent.pid"
+//! working_directory = "/"
+//! log_file = "/tmp/bpfagent.log"
+//!
+//! # EBPF programs to load and run
+//! [[ebpf_programs]]
+//! name = "kfree_skb"
+//! enabled = true
+//!
+//! [[ebpf_programs]]
+//! name = "sca"
+//! enabled = true
+//! ```
+//!
+//! # Search Paths
+//!
+//! If no config file is specified, the application searches these paths:
+//! - `/etc/bpfagent.conf`
+//! - `/etc/bpfagent/bpfagent.conf`
+//! - `/usr/local/etc/bpfagent.conf`
+//! - `/usr/local/etc/bpfagent/bpfagent.conf`
+//! - `~/.bpfagent.conf`
+//! - `~/.config/bpfagent/config.toml`
+//! - `./bpfagent.conf` (current directory for development)
+
 use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
+use anyhow::Context;
 use log::debug;
 use serde::Deserialize;
 
@@ -40,6 +74,12 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// Load daemon configuration from file or use defaults
+    ///
+    /// Searches standard config paths if no custom path provided.
+    ///
+    /// # Errors
+    /// Returns error if custom config is specified but doesn't exist or is invalid TOML
     pub fn load(custom_config: Option<String>) -> Result<Self, anyhow::Error> {
         // If custom config file is provided, use it
         if let Some(config_path) = custom_config {
@@ -47,7 +87,10 @@ impl DaemonConfig {
             if path.exists() {
                 return Self::load_from_path(path);
             } else {
-                return Err(anyhow!("config file not found: {}", config_path));
+                return Err(anyhow::anyhow!(
+                    "specified config file does not exist: {}",
+                    config_path
+                ));
             }
         }
 
@@ -78,20 +121,23 @@ impl DaemonConfig {
             }
         }
 
-        debug!("No config file found, using defaults");
+        debug!("No config file found in standard paths, using defaults");
         Ok(Self::default())
     }
 
+    /// Load configuration from a specific file path
+    ///
+    /// # Errors
+    /// Returns error if file cannot be read or contains invalid TOML
     fn load_from_path(path: &Path) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("failed to read config file {}: {}", path.display(), e))?;
+            .context(format!("failed to read config file: {}", path.display()))?;
 
-        log::debug!("Config file content length: {}", content.len());
-        log::debug!("Config file content bytes: {:?}", content.as_bytes());
+        debug!("Config file content length: {} bytes", content.len());
 
-        let config: Self = toml::from_str(&content)
-            .map_err(|e| anyhow!("failed to parse config file {}: {}", path.display(), e))?;
-
-        Ok(config)
+        toml::from_str(&content).context(format!(
+            "failed to parse config file as TOML: {}",
+            path.display()
+        ))
     }
 }

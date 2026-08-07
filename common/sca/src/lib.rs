@@ -30,9 +30,5 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_readv", "syscalls", "sys_enter_readv"),
 ];
 
-/// eBPF: Process name to match
-#[cfg(not(feature = "user"))]
-pub const PROCESS_NAME: &[u8] = b"Relay1";
-
 /// Max entries for socket fd map
 pub const SOCKET_FD_MAP_MAX_ENTRIES: u32 = 256;

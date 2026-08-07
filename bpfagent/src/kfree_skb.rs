@@ -1,3 +1,25 @@
+//! kfree_skb eBPF Program - Kernel Packet Drop Tracing
+//!
+//! This module provides a BPF program that traces the kernel's `kfree_skb` tracepoint
+//! to collect statistics on why network packets are being dropped.
+//!
+//! The eBPF program attaches to the `skb:kfree_skb` tracepoint and increments counters
+//! for each drop reason defined in the kernel's `enum skb_drop_reason`.
+//!
+//! # Prometheus Metrics
+//!
+//! - `kfree_skb_total_drops`: Total number of SKB drops
+//! - `kfree_skb_drops_by_reason`: Count of drops by reason code and name
+//!
+//! # Example Output
+//!
+//! ```text
+//! Drop counts (total: 1234):
+//!   10 (TCP_CSUM               ): 456
+//!   64 (QDISC_DROP             ): 321
+//!    3 (NO_SOCKET              ): 234
+//! ```
+
 use std::{any::Any, sync::Arc};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
@@ -14,15 +36,20 @@ pub struct KfreeSkbMetrics {
 }
 
 impl KfreeSkbMetrics {
-    pub fn new(registry: Arc<Registry>) -> Self {
+    /// Create new kfree_skb Prometheus metrics with proper error handling
+    ///
+    /// # Errors
+    /// Returns error if metric creation or registration fails
+    pub fn new(registry: Arc<Registry>) -> anyhow::Result<Self> {
         let total_drops = IntCounterVec::new(
             Opts::new("kfree_skb_total_drops", "Total number of dropped packets"),
             &["reason"],
         )
-        .expect("failed to create total_drops counter");
+        .map_err(|e| anyhow::anyhow!("failed to create total_drops counter: {}", e))?;
+
         registry
             .register(Box::new(total_drops.clone()))
-            .expect("failed to register total_drops counter");
+            .map_err(|e| anyhow::anyhow!("failed to register total_drops counter: {}", e))?;
 
         let drops_by_reason = IntCounterVec::new(
             Opts::new(
@@ -31,15 +58,16 @@ impl KfreeSkbMetrics {
             ),
             &["reason_code", "reason_name"],
         )
-        .expect("failed to create drops_by_reason counter");
+        .map_err(|e| anyhow::anyhow!("failed to create drops_by_reason counter: {}", e))?;
+
         registry
             .register(Box::new(drops_by_reason.clone()))
-            .expect("failed to register drops_by_reason counter");
+            .map_err(|e| anyhow::anyhow!("failed to register drops_by_reason counter: {}", e))?;
 
-        Self {
+        Ok(Self {
             total_drops,
             drops_by_reason,
-        }
+        })
     }
 }
 
@@ -119,7 +147,7 @@ impl EbpfProgram for KfreeSkbProgram {
 
 impl MetricsDisplay for KfreeSkbProgram {
     fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
-        let metrics = KfreeSkbMetrics::new(registry);
+        let metrics = KfreeSkbMetrics::new(registry)?;
         self.set_metrics(metrics);
         Ok(())
     }
