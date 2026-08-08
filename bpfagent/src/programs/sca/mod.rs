@@ -31,7 +31,7 @@ use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use log::{debug, info, warn};
 use prometheus::{IntGaugeVec, Opts, Registry};
 
-use crate::program::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
+use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Module re-exports for convenience
 use sca_common;

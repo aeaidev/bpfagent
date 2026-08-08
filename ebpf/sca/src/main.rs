@@ -13,7 +13,7 @@ use sca_common::SOCKET_FD_MAP_MAX_ENTRIES;
 /// Socket file descriptors map
 #[map]
 pub static SOCKET_FD_MAP: HashMap<u32, u8> =
-    HashMap::with_max_entries(SOCKET_FD_MAP_MAX_ENTRIES as u32, 0);
+    HashMap::with_max_entries(SOCKET_FD_MAP_MAX_ENTRIES, 0);
 
 // Timestamp map: key = (protocol + msg_type), value = timestamp
 #[map]

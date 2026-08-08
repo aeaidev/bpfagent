@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # bpfagent service for tracing kernel metrics
+  bpfagent:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    container_name: bpfagent
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - SYS_PTRACE
+    volumes:
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      - /etc/bpfagent:/etc/bpfagent
+      - bpfagent_data:/var/lib/bpfagent
+    ports:
+      - "9101:9101"
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # Prometheus for scraping metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - bpfagent
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Grafana for visualizing metrics
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  bpfagent_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge

@@ -3,7 +3,17 @@
 A generic eBPF agent application that manages multiple eBPF programs and exposes Prometheus metrics. It includes:
 
 - **kfree_skb** - traces kernel packet drops
-- **SCA (Socket Communication Analyzer)** - traces socket communication latency per process
+- **SCA** - traces socket communication latency per process
+
+## Quick Links
+
+- 📖 **[Architecture Guide](docs/ARCHITECTURE.md)** - System design and components
+- 🔧 **[Development Guide](docs/DEVELOPMENT.md)** - Build, test, and debug
+- 🛠️ **[Plugin Development](docs/PLUGINS.md)** - Create new eBPF programs
+- 📝 **[Contributing](docs/CONTRIBUTING.md)** - How to contribute
+- ⚙️ **[Configuration](config/bpfagent.conf.full)** - Full config options
+- 🐳 **[Examples](examples/)** - Deployment examples (Docker, systemd)
+- 📋 **[Changelog](CHANGELOG.md)** - Version history
 
 ## Overview
 
@@ -14,6 +24,37 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 ### SCA Program
 
 The SCA program traces socket communication latency by measuring the timestamp difference between NNG protocol messages. It uses a combined key of Protocol (4B) + Message Type (2B) to match REQ/REP message pairs on Unix domain sockets. It tracks the maximum latency per process name and exports metrics via Prometheus.
+
+## Quick Start
+
+### Prerequisites
+
+- Linux kernel 5.8+ with BPF support
+- Rust and Cargo
+- Development tools (see `./scripts/setup.sh`)
+
+### Build and Run
+
+```bash
+# Setup development environment
+./scripts/setup.sh
+
+# Build
+./scripts/build.sh release
+
+# Run in interactive mode
+sudo ./target/release/bpfagent --daemon=false
+
+# Run as daemon
+sudo ./target/release/bpfagent -d -f config/bpfagent.conf.example
+```
+
+### Access Metrics
+
+```bash
+# View metrics (while running)
+curl http://localhost:9101/metrics
+```
 
 ## Configuration
 
@@ -101,7 +142,7 @@ The application supports two running modes:
 **Daemon Mode (default)**
 - Runs in the background without stdout output
 - Only Prometheus metrics endpoint provides feedback
-- Use `-d` to enable (default) or `--daemon=false` to disable
+- Use `-d` to enable or `--daemon=false` to disable
 
 **Interactive Mode**
 - Displays statistics to stdout every 3 seconds
@@ -242,9 +283,9 @@ scrape_configs:
  kotlinx_skb_total_drops{reason="all"} 1234
 # HELP kfree_skb_drops_by_reason Number of drops by reason
 # TYPE kfree_skb_drops_by_reason counter
- kotlinx_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
- kotlinx_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
- kotlinx_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
+ kfree_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
+ kfree_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
+ kfree_skb_drops_by_reason{reason_code="3",reason_name="NO_SOCKET"} 234
 ```
 
 #### SCA

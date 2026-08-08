@@ -29,17 +29,15 @@
 //! 6. Enter event loop (periodically display/export metrics)
 //! 7. Gracefully shutdown on signals
 
-mod common;
+mod cli;
 mod config;
-mod kfree_skb;
 mod metrics;
-mod program;
-mod sca;
+mod programs;
 
 use std::{collections::HashMap, fs::File, os::unix::io::AsRawFd, sync::Arc};
 
 use clap::Parser;
-use common::BpfAgentArgs;
+use cli::BpfAgentArgs;
 use log::{debug, error, info, warn};
 use metrics::run_metrics_server;
 use prometheus::Registry;
@@ -49,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use aya_log::EbpfLogger;
 use tokio::io::unix::AsyncFd;
 
-use crate::program::{EbpfProgram, MetricsDisplay, ProgramRegistry};
+use crate::programs::{EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Register all available EBPF programs
 /// Each program module registers itself by calling `registry.register()`
@@ -58,8 +56,8 @@ fn register_programs() -> ProgramRegistry {
 
     // Initialize all program modules - each module registers itself
     // To add a new program, add its module and call its init function here
-    kfree_skb::init(&mut registry);
-    sca::init(&mut registry);
+    programs::kfree_skb::init(&mut registry);
+    programs::sca::init(&mut registry);
 
     registry
 }

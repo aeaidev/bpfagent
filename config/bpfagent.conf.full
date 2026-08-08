@@ -1,0 +1,53 @@
+# Full BPF Agent Configuration
+# This file demonstrates all available configuration options
+
+# Daemon Settings
+# ===============
+
+# Path to PID file (used to track the daemon process)
+pid_file = "/var/run/bpfagent.pid"
+
+# Working directory for the daemon process
+working_directory = "/"
+
+# Path to log file (used in daemon mode)
+log_file = "/var/log/bpfagent.log"
+
+
+# eBPF Programs
+# =============
+# Configure which eBPF programs to load and run
+# If no programs are specified, all registered programs are enabled by default
+
+[[ebpf_programs]]
+name = "kfree_skb"
+enabled = true
+# Traces kernel packet drops at kfree_skb tracepoint
+
+[[ebpf_programs]]
+name = "sca"
+enabled = true
+# Traces socket communication latency per process (NNG protocol)
+
+
+# Usage Notes
+# ===========
+#
+# 1. Default configuration paths (searched in order):
+#    - /etc/bpfagent.conf
+#    - /etc/bpfagent/bpfagent.conf
+#    - /usr/local/etc/bpfagent.conf
+#    - /usr/local/etc/bpfagent/bpfagent.conf
+#    - ~/.bpfagent.conf
+#    - ~/.config/bpfagent/config.toml
+#    - ./bpfagent.conf (current directory)
+#
+# 2. Specify custom config with: bpfagent -f /path/to/config.toml
+#
+# 3. Command-line options override configuration:
+#    - -d, --daemon          Run in daemon mode
+#    - -v, --verbose         Enable verbose output
+#    - -i, --metrics-ip      Metrics server IP (default: 0.0.0.0)
+#    - -p, --metrics-port    Metrics server port (default: 9101)
+#
+# 4. Metrics endpoint: http://<metrics-ip>:<metrics-port>/metrics

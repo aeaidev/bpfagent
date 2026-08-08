@@ -1,26 +1,7 @@
-//! BPF Program Registry and Trait Definitions
-//!
-//! This module provides the core traits and registry for managing eBPF programs.
-//! It defines the lifecycle (load, start, metrics) and plugin architecture for
-//! adding new eBPF programs to the agent.
-//!
-//! # Architecture
-//!
-//! The design uses trait objects to support multiple eBPF programs:
-//! - `EbpfProgram`: Core trait for program lifecycle
-//! - `MetricsDisplay`: Optional trait for programs that export metrics
-//! - `EbpfAccess`: Provides access to the underlying Aya Ebpf instance
-//!
-//! # Adding New Programs
-//!
-//! 1. Create a new module (e.g., `my_program.rs`)
-//! 2. Implement `EbpfProgram` and optionally `MetricsDisplay`
-//! 3. Call `registry.register()` in the module's `init()` function
-//! 4. Add the module to `main.rs` and call its `init()` in `register_programs()`
-
-use std::{any::Any, collections::HashMap, sync::Arc};
+//! BPF Program Traits and Interfaces
 
 use aya::Ebpf;
+use std::any::Any;
 
 /// Trait for eBPF programs that support metrics display and export
 pub trait MetricsDisplay {
@@ -28,7 +9,10 @@ pub trait MetricsDisplay {
     ///
     /// # Errors
     /// Returns error if metric registration fails
-    fn set_metrics_registry(&mut self, registry: Arc<prometheus::Registry>) -> anyhow::Result<()>;
+    fn set_metrics_registry(
+        &mut self,
+        registry: std::sync::Arc<prometheus::Registry>,
+    ) -> anyhow::Result<()>;
 
     /// Display collected metrics and update Prometheus metrics
     ///
@@ -104,48 +88,5 @@ pub trait EbpfProgram: EbpfAccess {
     /// used for periodic metrics collection and display
     fn as_metrics_mut(&mut self) -> Option<&mut dyn MetricsDisplay> {
         None
-    }
-}
-
-/// Registry for managing available and loaded eBPF programs
-pub struct ProgramRegistry {
-    factories: HashMap<String, Box<dyn Fn() -> Box<dyn EbpfProgram>>>,
-}
-
-impl ProgramRegistry {
-    /// Create a new empty program registry
-    pub fn new() -> Self {
-        Self {
-            factories: HashMap::new(),
-        }
-    }
-
-    /// Register an eBPF program factory
-    ///
-    /// The factory function will be called each time a program instance
-    /// needs to be created.
-    pub fn register<F>(&mut self, name: &str, factory: F)
-    where
-        F: Fn() -> Box<dyn EbpfProgram> + 'static,
-    {
-        self.factories.insert(name.to_string(), Box::new(factory));
-    }
-
-    /// Get list of all registered program names
-    pub fn available_programs(&self) -> Vec<String> {
-        self.factories.keys().cloned().collect()
-    }
-
-    /// Create an instance of a registered program
-    ///
-    /// Returns `None` if the program name is not registered
-    pub fn create_program(&self, name: &str) -> Option<Box<dyn EbpfProgram>> {
-        self.factories.get(name).map(|f| f())
-    }
-}
-
-impl Default for ProgramRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -1,0 +1,52 @@
+# Prometheus configuration for scraping bpfagent metrics
+#
+# This configuration scrapes metrics from bpfagent's HTTP endpoint
+# and stores them in the local time-series database.
+#
+# Use with: prometheus --config.file=prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'bpfagent-monitor'
+
+# Alertmanager configuration (optional)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Load rules once and periodically evaluate them
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # bpfagent metrics
+  - job_name: 'bpfagent'
+    static_configs:
+      - targets: ['localhost:9101']
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: '/metrics'
+
+  # Docker host metrics (optional)
+  # - job_name: 'docker-host'
+  #   static_configs:
+  #     - targets: ['localhost:9100']
+
+# Remote storage configuration (optional)
+# Uncomment to send metrics to a remote storage system
+# remote_write:
+#   - url: "http://remote-storage:9009/api/v1/push"
+#     queue_config:
+#       capacity: 10000
+#       max_shards: 200
+#       max_samples_per_send: 500

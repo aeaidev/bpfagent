@@ -1,0 +1,35 @@
+[Unit]
+Description=BPF Agent - eBPF Program Manager with Prometheus Metrics
+Documentation=man:bpfagent(8)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Main executable
+ExecStart=/usr/local/bin/bpfagent -d -f /etc/bpfagent.conf
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Security restrictions
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log /var/run /proc /sys
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bpfagent
+
+[Install]
+WantedBy=multi-user.target

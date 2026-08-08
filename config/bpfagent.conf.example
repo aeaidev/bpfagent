@@ -1,0 +1,15 @@
+# bpfagent configuration file
+
+# Daemon settings
+pid_file = "/tmp/bpfagent.pid"
+working_directory = "/"
+log_file = "/tmp/bpfagent.log"
+
+# EBPF programs to load and run
+[[ebpf_programs]]
+name = "kfree_skb"
+enabled = true
+
+[[ebpf_programs]]
+name = "sca"
+enabled = true

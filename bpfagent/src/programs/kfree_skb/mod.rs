@@ -27,7 +27,7 @@ use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
 use prometheus::{IntCounterVec, Opts, Registry};
 
-use crate::program::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
+use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
 /// Prometheus metrics for KfreeSkb program
 pub struct KfreeSkbMetrics {
