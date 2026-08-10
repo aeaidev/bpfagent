@@ -1,0 +1,18 @@
+{
+  "arch": "bpf",
+  "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n64",
+  "executables": true,
+  "linker-flavor": "ld.lld",
+  "llvm-abiname": "lp64d",
+  "llvm-target": "bpfel",
+  "max-atomic-width": 8,
+  "no-default-libraries": true,
+  "os": "none",
+  "pre-link-args": {
+    "ld.lld": [
+      "-melfbpf"
+    ]
+  },
+  "relocation-model": "static",
+  "target-pointer-width": "64"
+}

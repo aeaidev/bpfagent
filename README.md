@@ -23,7 +23,19 @@ This tool monitors the Linux kernel's `kfree_skb` tracepoint to collect statisti
 
 ### SCA Program
 
-The SCA program traces socket communication latency by measuring the timestamp difference between NNG protocol messages. It uses a combined key of Protocol (4B) + Message Type (2B) to match REQ/REP message pairs on Unix domain sockets. It tracks the maximum latency per process name and exports metrics via Prometheus.
+The SCA program traces socket communication latency by measuring the timestamp difference between sends to and from Unix domain sockets. It tracks each hop in the data flow chain:
+
+- **DATA_SOURCE → INTERNAL_ROUTER**: Measures latency for `/tmp/DATA_L3_TO_INTERNAL_ROUTER`
+- **INTERNAL_ROUTER → RED_WF_COMM_L**: Measures latency for `/tmp/DATA_L3_TO_WF_L`
+- **RED_WF_COMM_L → FRAGMENTER**: Measures latency for `/tmp/WF_L_TO_FRAG`
+- **FRAGMENTER → RED_IRSS_COMM_L**: Measures latency for `/tmp/FRAG_TO_IRSS_L`
+
+For each hop, it:
+1. Stores timestamp when the sending process sends TO the listening socket
+2. Looks up timestamp when the receiving process sends FROM that socket
+3. Calculates latency as the timestamp difference
+
+Latencies are tracked using a sliding window moving average (2-second window) and exported via Prometheus.
 
 ## Quick Start
 
@@ -100,13 +112,11 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - Displays drop statistics every 3 seconds
   - Uses BPF CO-RE compatible types via Aya framework
 - **SCA program** - traces socket communication latency per process
-  - Measures latency based on NNG protocol message timestamp differences
-  - Uses combined key of Protocol (4B) + Message Type (2B) to match REQ/REP pairs
-  - On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
-  - On send: looks up timestamp with key = Protocol + MSG_Type
+  - Measures latency based on socket path + direction (TO/FROM) matching
+  - On send TO listening socket: stores timestamp with key = socket_path + "TO"
+  - On send FROM listening socket: looks up timestamp with key = socket_path + "FROM"
   - Calculates latency as timestamp difference on match
-  - Tracks maximum latency per process name
-  - Resets latency values every 2 seconds
+  - Tracks moving average latency per process name (2-second sliding window)
   - Exports metrics via Prometheus with process name labels
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
@@ -271,7 +281,7 @@ scrape_configs:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sca_max_latency_per_pname` | Gauge | `pname` | Maximum latency in microseconds per process name (based on NNG Protocol + Message Type key timestamp difference) |
+| `sca_avg_latency_per_pname` | Gauge | `pname` | Moving average latency in microseconds per process name (based on socket path + direction timestamp difference) |
 
 ### Metrics Output Example
 
@@ -290,11 +300,11 @@ scrape_configs:
 
 #### SCA
 
-The SCA program calculates latency based on NNG protocol message timestamp differences using a combined key:
-- Key format: Protocol (4B) + Message Type (2B) = 6 bytes combined into u64
-- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
-- On send: looks up timestamp with key = Protocol + MSG_Type
-- Latency is calculated as the timestamp difference on match
+The SCA program calculates latency based on socket path + direction matching:
+- Key format: socket_path + "TO" (for sends to listening socket) or socket_path + "FROM" (for sends from listening socket)
+- On send TO listening socket: stores timestamp
+- On send FROM listening socket: looks up and calculates latency
+- Latency is calculated as current_timestamp - stored_timestamp on match
 
 ```
 # HELP sca_max_latency_per_pname Maximum latency in microseconds per process name (based on NNG Protocol + Message Type timestamp difference)
@@ -317,10 +327,10 @@ Drop counts (total: 1234):
 
 ### SCA Output
 
-The SCA program tracks latency based on NNG Protocol + Message Type key matching:
-- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
-- On send: looks up timestamp with key = Protocol + MSG_Type
-- Latency is calculated as the timestamp difference on match
+The SCA program tracks latency based on socket path + direction matching for each hop:
+- On send TO listening socket: stores timestamp
+- On send FROM listening socket: looks up and calculates latency
+- Latency is calculated as current_timestamp - stored_timestamp on match
 
 ```
 --- Max Latency per Process Name ---

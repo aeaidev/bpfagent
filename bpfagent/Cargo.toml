@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 prometheus = { workspace = true, default-features = false, features = ["process"] }
 kfree_skb-common = { path = "../common/kfree_skb" }
-sca-common = { path = "../common/sca" }
+sca-common = { path = "../common/sca", features = ["user"] }
 procfs = { version = "0.15", default-features = false }
 
 [build-dependencies]

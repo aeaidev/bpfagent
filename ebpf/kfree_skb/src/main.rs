@@ -36,15 +36,10 @@ unsafe fn try_kfree_skb(ctx: TracePointContext) -> Result<u32, u32> {
     // Use bpf_probe_read_kernel to safely read the value
     let reason_raw: u32 =
         unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(reason_ptr).map_err(|e| e as u32)? };
-    // Convert to our SkbDropReason enum
-    let reason: SkbDropReason = reason_raw.into();
+    // Convert to our SkbDropReason enum (unused, for reference)
+    let _reason: SkbDropReason = reason_raw.into();
 
-    debug!(
-        &ctx,
-        "kfree_skb called with reason: {} ({})",
-        reason_raw,
-        reason_name(reason)
-    );
+    debug!(&ctx, "kfree_skb called with reason: {}", reason_raw);
 
     // Increment the counter for this reason
     // The HashMap uses interior mutability, so we don't need mutable reference
@@ -66,8 +61,6 @@ unsafe fn try_kfree_skb(ctx: TracePointContext) -> Result<u32, u32> {
 
     Ok(0)
 }
-
-use kfree_skb_common::reason_name;
 
 #[cfg(not(test))]
 #[panic_handler]

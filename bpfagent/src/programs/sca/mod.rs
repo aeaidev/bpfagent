@@ -4,31 +4,29 @@
 //! by measuring the timestamp difference between NNG protocol messages.
 //!
 //! The eBPF program attaches to various tracepoints (sendmsg, write, etc.) and
-//! uses a combined key of Protocol (4B) + Message Type (2B) to match REQ/REP
-//! message pairs on Unix domain sockets.
+//! uses a key of Protocol to match REQ/REP message pairs on Unix domain sockets.
 //!
 //! # Latency Calculation
 //!
-//! - On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
-//! - On send: looks up timestamp with key = Protocol + MSG_Type
+//! - First send (to listening socket): stores timestamp with key = Protocol
+//! - Second send (from listening socket as response): looks up with same Protocol key
 //! - Latency is calculated as the timestamp difference on match
 //!
-//! # Prometheus Metrics
+//! # Moving Average
 //!
-//! - `sca_max_latency_per_pname`: Maximum latency in microseconds per process name
+//! Latencies are tracked using a sliding window moving average:
+//! - Maintains sum and count of latencies within a 2-second window
+//! - Average = sum / count
+//! - Window resets when more than 2 seconds have elapsed
 //!
-//! # Example Output
+//! Prometheus Metrics
 //!
-//! ```text
-//! --- Max Latency per Process Name ---
-//!   INTERNAL_ROUTER: 150 us
-//!   FRAGMENTER: 280 us
-//! ```
+//! - `sca_avg_latency_per_pname`: Moving average latency in microseconds per process name
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
-use log::{debug, info, warn};
+use log::{debug, error, info, trace, warn};
 use prometheus::{IntGaugeVec, Opts, Registry};
 
 use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
@@ -36,9 +34,14 @@ use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 /// Module re-exports for convenience
 use sca_common;
 
+/// SocketHop type from common - used for both userspace and eBPF
+/// The struct layout must match between userspace and eBPF
+/// Since both define it as #[repr(C)] with the same u32 fields, they are binary compatible
+pub use sca_common::SocketHop;
+
 /// Prometheus metrics for SCA program
 pub struct ScaMetrics {
-    pub max_latency_per_pname: IntGaugeVec,
+    pub avg_latency_per_pname: IntGaugeVec,
 }
 
 impl ScaMetrics {
@@ -47,23 +50,23 @@ impl ScaMetrics {
     /// # Errors
     /// Returns error if metric creation or registration fails
     pub fn new(registry: Arc<Registry>) -> anyhow::Result<Self> {
-        let max_latency_per_pname = IntGaugeVec::new(
+        let avg_latency_per_pname = IntGaugeVec::new(
             Opts::new(
-                "sca_max_latency_per_pname",
-                "Maximum latency in microseconds per process name",
+                "sca_avg_latency_per_pname",
+                "Average latency in microseconds per process name",
             ),
             &["pname"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create max_latency_per_pname gauge: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to create avg_latency_per_pname gauge: {}", e))?;
 
         registry
-            .register(Box::new(max_latency_per_pname.clone()))
+            .register(Box::new(avg_latency_per_pname.clone()))
             .map_err(|e| {
-                anyhow::anyhow!("failed to register max_latency_per_pname gauge: {}", e)
+                anyhow::anyhow!("failed to register avg_latency_per_pname gauge: {}", e)
             })?;
 
         Ok(Self {
-            max_latency_per_pname,
+            avg_latency_per_pname,
         })
     }
 }
@@ -73,6 +76,10 @@ pub struct ScaProgram {
     name: String,
     ebpf: Option<Ebpf>,
     metrics: Option<ScaMetrics>,
+    /// Mapping of FD to socket path for display metrics
+    socket_fd_map: std::collections::HashMap<u32, String>,
+    /// Mapping of PID to process name for display metrics
+    socket_pid_map: std::collections::HashMap<u32, String>,
 }
 
 impl ScaProgram {
@@ -82,6 +89,8 @@ impl ScaProgram {
             name: "sca".to_string(),
             ebpf: None,
             metrics: None,
+            socket_fd_map: std::collections::HashMap::new(),
+            socket_pid_map: std::collections::HashMap::new(),
         }
     }
 
@@ -108,9 +117,18 @@ impl EbpfProgram for ScaProgram {
             "/sca"
         )))?;
 
-        debug!("Loaded BPF program, attaching tracepoints...");
+        debug!("Loaded BPF program, pre-populating SOCKET_HOPS_MAP...");
 
-        // Load and attach tracepoints
+        // Pre-populate SOCKET_HOPS_MAP with default values based on DATA_FLOW
+        prepopulate_socket_hops_map(&mut ebpf)?;
+
+        // Populate socket fd map from running processes
+        // This also populates socket_fd_map and socket_pid_map for metrics display
+        populate_socket_fd_map(&mut self.socket_fd_map, &mut self.socket_pid_map, &mut ebpf)?;
+
+        debug!("SOCKET_HOPS_MAP populated, now attaching tracepoints...");
+
+        // Load and attach tracepoints AFTER map is populated
         for (name, category, event) in sca_common::TRACEPOINTS {
             let program: &mut TracePoint = ebpf
                 .program_mut(name)
@@ -122,15 +140,6 @@ impl EbpfProgram for ScaProgram {
         }
 
         debug!("All tracepoints attached successfully");
-
-        // Initialize process names map
-        populate_process_names_map(&mut ebpf, sca_common::PROCESS_NAMES)?;
-
-        // Populate socket fd map from running processes
-        populate_socket_fd_map(&mut ebpf, sca_common::SOCKET_PATHS)?;
-
-        // Populate LATENCY_PNAME_HASH with process names and value 0
-        populate_latency_pname_hash(&mut ebpf)?;
 
         self.ebpf = Some(ebpf);
 
@@ -174,38 +183,87 @@ impl MetricsDisplay for ScaProgram {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("BPF program not loaded"))?;
 
-        if let Some(map) = ebpf.map("LATENCY_PNAME_HASH") {
-            let latency_map: HashMap<_, [u8; 16], u64> = map.try_into().unwrap();
-            info!("--- Max Latency per Process Name ---");
+        // Read sum and count from separate maps (PID-based)
+        let sum_map: HashMap<_, u32, u64> = ebpf
+            .map("LATENCY_PID_SUM")
+            .ok_or_else(|| anyhow::anyhow!("LATENCY_PID_SUM not found"))?
+            .try_into()?;
 
-            // Try to get all entries using the iter method
-            for entry in latency_map.iter() {
-                match entry {
-                    Ok((pname, latency)) => {
-                        // Convert process name from bytes to string, trimming null bytes
-                        let pname_str = String::from_utf8_lossy(&pname)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        let latency_us = latency / 1000; // convert nano to micro
-                        info!("  {}: {} us", pname_str, latency_us);
+        let count_map: HashMap<_, u32, u64> = ebpf
+            .map("LATENCY_PID_COUNT")
+            .ok_or_else(|| anyhow::anyhow!("LATENCY_PID_COUNT not found"))?
+            .try_into()?;
 
-                        // Update Prometheus metrics with max latency in microseconds
-                        metrics
-                            .max_latency_per_pname
-                            .with_label_values(&[&pname_str])
-                            .set(latency_us as i64);
-                    }
-                    Err(e) => {
-                        debug!("Failed to read entry: {}", e);
-                    }
-                }
-            }
-
-            debug!("Displaying max latency per process name");
-        } else {
-            warn!("LATENCY_PNAME_HASH not found");
+        // Check if tracepoint is being called
+        let tracepoint_counter_map: HashMap<_, u32, u64> = ebpf
+            .map("TRACEPOINT_COUNTER")
+            .ok_or_else(|| anyhow::anyhow!("TRACEPOINT_COUNTER not found"))?
+            .try_into()?;
+        match tracepoint_counter_map.get(&0, 0) {
+            Ok(count) => trace!("TRACEPOINT_COUNTER: {}", count),
+            Err(_) => trace!("TRACEPOINT_COUNTER: 0 (no entries)"),
         }
 
+        info!("--- Moving Average Latency per PID ---");
+
+        // Get all PIDs from the maps and calculate averages
+        let mut all_pids: HashSet<u32> = HashSet::new();
+        for result in sum_map.iter() {
+            let (pid, _) =
+                result.map_err(|e| anyhow::anyhow!("Failed to iterate LATENCY_PID_SUM: {}", e))?;
+            all_pids.insert(pid);
+        }
+        for result in count_map.iter() {
+            let (pid, _) = result
+                .map_err(|e| anyhow::anyhow!("Failed to iterate LATENCY_PID_COUNT: {}", e))?;
+            all_pids.insert(pid);
+        }
+
+        for pid in all_pids {
+            let sum = sum_map.get(&pid, 0).unwrap_or(0);
+            let count = count_map.get(&pid, 0).unwrap_or(0);
+
+            // Calculate average latency
+            let avg_latency = if count > 0 { sum / count } else { 0 };
+            let avg_latency_us = avg_latency / 1000; // convert nano to micro
+
+            // Get process name from socket_pid_map, default to "unknown"
+            let process_name = self
+                .socket_pid_map
+                .get(&pid)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+
+            // Get socket path if available
+            let socket_path = self
+                .socket_fd_map
+                .iter()
+                .find(|(_, path)| path.contains(&format!("{}", pid)))
+                .map(|(_, path)| path.as_str())
+                .unwrap_or("");
+
+            info!(
+                "  {} (PID {}): {} us (count: {}){}",
+                process_name,
+                pid,
+                avg_latency_us,
+                count,
+                if !socket_path.is_empty() {
+                    format!(" path={}", socket_path)
+                } else {
+                    String::new()
+                }
+            );
+
+            // Update Prometheus metrics with average latency in microseconds
+            let label = format!("{} (PID {})", process_name, pid);
+            metrics
+                .avg_latency_per_pname
+                .with_label_values(&[&label])
+                .set(avg_latency_us as i64);
+        }
+
+        debug!("Displaying moving average latency per PID");
         Ok(())
     }
 }
@@ -227,155 +285,218 @@ pub fn init(registry: &mut ProgramRegistry) {
     registry.register("sca", || Box::new(ScaProgram::new()));
 }
 
-/// Initialize PROCESS_NAMES_MAP
-fn populate_process_names_map(ebpf: &mut Ebpf, process_names: &[&str]) -> anyhow::Result<()> {
-    if let Some(map) = ebpf.map_mut("PROCESS_NAMES_MAP") {
-        let mut process_names_map: aya::maps::HashMap<_, [u8; 16], u8> = map.try_into()?;
-        process_names
-            .iter()
-            .map(|process_name| {
-                let mut key: [u8; 16] = [0; 16];
-                let bytes = process_name.as_bytes();
-                let len = bytes.len().min(16);
-                key[0..len].copy_from_slice(&bytes[0..len]);
-                (key, process_name)
-            })
-            .for_each(|(key, process_name)| {
-                process_names_map.insert(&key, &1, 0).unwrap();
-                debug!(
-                    "Inserted process name {} into PROCESS_NAMES_MAP",
-                    process_name
-                );
-            });
-    } else {
-        warn!("PROCESS_NAMES_MAP not found");
-    }
-
-    Ok(())
-}
-
-/// Populate LATENCY_PNAME_HASH with process names and value 0
-fn populate_latency_pname_hash(ebpf: &mut Ebpf) -> anyhow::Result<()> {
-    debug!("Populating LATENCY_PNAME_HASH with process names");
-
-    if let Some(map) = ebpf.map_mut("LATENCY_PNAME_HASH") {
-        let mut latency_pname_map: aya::maps::HashMap<_, [u8; 16], u64> = map
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to get LATENCY_PNAME_HASH"))?;
-
-        for process_name in sca_common::PROCESS_NAMES {
-            let mut key: [u8; 16] = [0; 16];
-            let len = process_name.len().min(16);
-            key[0..len].copy_from_slice(process_name.as_bytes());
-
-            // Only insert if not already present
-            match latency_pname_map.get(&key, 0) {
-                Ok(_) => {
-                    debug!(
-                        "Process name {} already in LATENCY_PNAME_HASH, skipping",
-                        process_name
-                    );
-                }
-                Err(_) => {
-                    latency_pname_map.insert(&key, &0, 0).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to insert process name {} into LATENCY_PNAME_HASH: {}",
-                            process_name,
-                            e
-                        )
-                    })?;
-                    debug!(
-                        "Inserted process name {} with value 0 into LATENCY_PNAME_HASH",
-                        process_name
-                    );
-                }
-            }
-        }
-    } else {
-        warn!("LATENCY_PNAME_HASH not found");
-    }
-
+/**
+ * Pre-populate SOCKET_HOPS_MAP with default (zeroed) values based on DATA_FLOW configuration.
+ * This ensures the map has entries for all configured socket hops, even if FDs aren't found yet.
+ */
+fn prepopulate_socket_hops_map(_ebpf: &mut Ebpf) -> anyhow::Result<()> {
+    // SOCKET_HOPS_MAP is now populated directly in populate_socket_fd_map
+    // This function is kept for potential future pre-initialization if needed
     Ok(())
 }
 
 /**
- * Populate SOCKET_FD_MAP with file descriptors from Unix sockets
+ * Populate SOCKET_HOPS_MAP with file descriptors from Unix sockets.
+ * Reads lsof output to find socket FDs and their associated PIDs,
+ * then populates SOCKET_HOPS_MAP with FD/PID configurations.
+ *
+ * The SOCKET_HOPS_MAP BPF map is shared between eBPF and userspace.
+ * Userspace populates SOCKET_HOPS_MAP with FD/PID configurations,
+ * eBPF reads from SOCKET_HOPS_MAP to get hop configurations.
+ *
+ * Also populates local socket_fd_map and socket_pid_map for metrics display.
  */
-fn populate_socket_fd_map(ebpf: &mut Ebpf, _socket_paths: &[&str]) -> anyhow::Result<()> {
-    debug!("Populating SOCKET_FD_MAP with all Unix socket fds from allowed processes");
+fn populate_socket_fd_map(
+    socket_fd_map: &mut std::collections::HashMap<u32, String>,
+    socket_pid_map: &mut std::collections::HashMap<u32, String>,
+    ebpf: &mut Ebpf,
+) -> anyhow::Result<()> {
+    debug!("Populating SOCKET_HOPS_MAP with Unix socket fds from running processes");
 
-    // Populate SOCKET_FD_MAP from process file descriptors
-    for process_name in sca_common::PROCESS_NAMES {
-        // Find PIDs for this process name
-        let mut pids = Vec::new();
-
-        for entry in procfs::process::all_processes()
-            .map_err(|e| anyhow::anyhow!("Failed to get all processes: {}", e))?
-        {
-            let process = entry.map_err(|e| anyhow::anyhow!("Failed to get process: {}", e))?;
-            let stat = process
-                .stat()
-                .map_err(|e| anyhow::anyhow!("Failed to get process stat: {}", e))?;
-            if stat.comm == *process_name {
-                pids.push(process.pid as u32);
-            }
-        }
-
-        if pids.is_empty() {
-            debug!("No processes found for name {}", process_name);
-        } else {
-            debug!("Found {} PIDs for process {}", pids.len(), process_name);
-        }
-
-        for pid in pids {
-            let process = procfs::process::Process::new(pid as i32)
-                .map_err(|e| anyhow::anyhow!("Failed to get process {}: {}", pid, e))?;
-            let fds = process.fd().map_err(|e| {
-                anyhow::anyhow!("Failed to get file descriptors for process {}: {}", pid, e)
-            })?;
-
-            let mut socket_count = 0;
-            for fd_result in fds {
-                let fd_info =
-                    fd_result.map_err(|e| anyhow::anyhow!("Failed to read fd info: {}", e))?;
-
-                // Only process Unix sockets
-                let procfs::process::FDTarget::Socket(_inode) = fd_info.target else {
-                    continue;
-                };
-
-                socket_count += 1;
-
-                if let Some(map) = ebpf.map_mut("SOCKET_FD_MAP") {
-                    let mut socket_fd_map: aya::maps::HashMap<_, u32, u8> = map
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_FD_MAP"))?;
-                    socket_fd_map
-                        .insert(&(fd_info.fd as u32), &1, 0)
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to insert fd {} into SOCKET_FD_MAP: {}",
-                                fd_info.fd,
-                                e
-                            )
-                        })?;
-                    debug!(
-                        "Inserted fd {} (process {}) into SOCKET_FD_MAP",
-                        fd_info.fd, pid
-                    );
-                } else {
-                    warn!("SOCKET_FD_MAP not found");
+    // Get all PIDs from DATA_FLOW by reading /proc/*/comm
+    // We need to collect PIDs for both sending and receiving processes
+    let mut process_pid_map: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::new();
+    for (_socket_path, sending, receiving) in sca_common::DATA_FLOW {
+        for &process_name in &[sending, receiving] {
+            if !process_pid_map.contains_key(process_name) {
+                if let Some(pid) = get_pid_by_process_name(process_name) {
+                    process_pid_map.insert(process_name, pid);
+                    info!("Found PID {} for process {}", pid, process_name);
                 }
-            }
-
-            if socket_count > 0 {
-                debug!(
-                    "Found {} Unix socket(s) in process {} (PID {})",
-                    socket_count, process_name, pid
-                );
             }
         }
     }
 
+    // Run lsof to get socket FDs from running processes
+    // Parse PID, FD, and socket path from lsof output
+    // Format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+    // Filter for type=STREAM (CONNECTED) Unix sockets only
+    // The TYPE info is in fields 10-11: 'type=STREAM (CONNECTED)'
+    // Note: FD is in field 4, socket path is in field 9
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"sudo -n lsof 2>/dev/null | awk '$4 ~ /u$/ && $10 ~ /type=STREAM/ && $11 ~ /CONNECTED/ {gsub(/u$/,"",$4); print "PID:"$2" FD:"$4" "$9}' | grep -E '/tmp/(DATA_L3_TO|DATA_L_TO|WF_L_TO|FRAG_TO|IRSS_L_TO)'"#)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run lsof command: {}", e))?;
+
+    if !output.status.success() {
+        warn!(
+            "lsof command failed, stdout: {}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Continue anyway - the map might be empty but not an error
+    }
+
+    // Debug: log the raw lsof output
+    debug!(
+        "Raw lsof output: stdout='{}', stderr='{}'",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Parse lsof output and build FD -> (pid, socket_path) map
+    // Only include FDs that belong to interesting processes from DATA_FLOW
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fd_to_info: std::collections::HashMap<u32, (u32, String)> =
+        std::collections::HashMap::new();
+
+    for line in stdout.lines() {
+        // Parse lines like: "PID:1234 FD:5 /tmp/DATA_L3_TO_INTERNAL_ROUTER"
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            // Extract PID
+            let pid_part = parts.get(0).unwrap_or(&"");
+            let pid_str = pid_part.strip_prefix("PID:").unwrap_or("");
+            let pid = pid_str.parse::<u32>().ok();
+
+            // Extract FD
+            let fd_part = parts.get(1).unwrap_or(&"");
+            let fd_str = fd_part.strip_prefix("FD:").unwrap_or("");
+            let fd = fd_str.parse::<u32>().ok();
+
+            // Extract socket path
+            let socket_path = parts.get(2).unwrap_or(&"").to_string();
+
+            if let (Some(pid), Some(fd)) = (pid, fd) {
+                // Check if this PID is one of the interesting processes from DATA_FLOW
+                let is_interesting = sca_common::DATA_FLOW.iter().any(|(_, sending, receiving)| {
+                    process_pid_map.get(sending) == Some(&pid)
+                        || process_pid_map.get(receiving) == Some(&pid)
+                });
+
+                if is_interesting {
+                    fd_to_info.insert(fd, (pid, socket_path.clone()));
+                    info!("Found FD {} (PID {}) for path {}", fd, pid, socket_path);
+                }
+            }
+        }
+    }
+
+    debug!("Found {} interesting socket FDs", fd_to_info.len());
+    debug!("fd_to_info contents: {:?}", fd_to_info);
+
+    // Populate SOCKET_HOPS_MAP
+    // Use FD as the key for direct lookup in eBPF
+    let socket_hops_map_name = "SOCKET_HOPS_MAP";
+
+    // Get reference to the map
+    if let Some(map) = ebpf.map_mut(socket_hops_map_name) {
+        debug!("SOCKET_HOPS_MAP found");
+        // Convert to HashMap to work with it
+        let mut hops_map: HashMap<_, u32, SocketHop> = map
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
+
+        debug!(
+            "SOCKET_HOPS_MAP max entries: {}",
+            sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES
+        );
+
+        debug!(
+            "About to insert {} entries into SOCKET_HOPS_MAP",
+            fd_to_info.len()
+        );
+
+        for (fd, (_pid, socket_path)) in fd_to_info.iter() {
+            // For each socket path, we need to determine sending and receiving PIDs
+            // We'll use the DATA_FLOW configuration to find matching entries
+            for (_hop_key, (flow_path, sending, receiving)) in
+                sca_common::DATA_FLOW.iter().enumerate()
+            {
+                if *flow_path == socket_path.as_str() {
+                    // Get the actual PIDs for sending and receiving processes
+                    let s_pid = process_pid_map.get(sending).copied();
+                    let r_pid = process_pid_map.get(receiving).copied();
+
+                    if let (Some(s_pid), Some(r_pid)) = (s_pid, r_pid) {
+                        // Update local socket_fd_map with FD -> path mapping
+                        socket_fd_map.insert(*fd, socket_path.clone());
+                        info!("Added to socket_fd_map: fd={} -> path={}", fd, socket_path);
+
+                        // Update local socket_pid_map with PID -> process name mapping
+                        // Names are used in display metrics only
+                        socket_pid_map.insert(s_pid, sending.to_string());
+                        socket_pid_map.insert(r_pid, receiving.to_string());
+                        info!(
+                            "Added to socket_pid_map: s_pid={} -> {}, r_pid={} -> {}",
+                            s_pid, sending, r_pid, receiving
+                        );
+
+                        // Create the hop with the FD and PIDs
+                        let hop = SocketHop {
+                            listening_socket_fd: *fd,
+                            sending_process_id: s_pid,
+                            receiving_process_id: r_pid,
+                        };
+
+                        // Write to SOCKET_HOPS_MAP using FD as the key
+                        debug!(
+                            "Attempting to insert hop with fd {} into SOCKET_HOPS_MAP",
+                            fd
+                        );
+                        match hops_map.insert(fd, &hop, 0) {
+                            Ok(()) => info!(
+                                "Added to SOCKET_HOPS_MAP with fd {}: sending_pid={}, receiving_pid={}, path={}",
+                                fd, s_pid, r_pid, socket_path
+                            ),
+                            Err(e) => error!(
+                                "Failed to insert hop with fd {} into SOCKET_HOPS_MAP: {}",
+                                fd, e
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+    } else {
+        warn!("SOCKET_HOPS_MAP not found");
+    }
     Ok(())
+}
+
+/// Get PID from process name by reading /proc/*/comm
+fn get_pid_by_process_name(process_name: &str) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let dir_name = entry.file_name();
+        let pid_str = dir_name.to_string_lossy();
+
+        // Skip non-numeric directories
+        if pid_str.parse::<u32>().is_err() {
+            continue;
+        }
+
+        // Read comm file to get process name
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            // comm file contains process name with newline
+            let comm = comm.trim();
+            if comm == process_name {
+                return pid_str.parse::<u32>().ok();
+            }
+        }
+    }
+    None
 }

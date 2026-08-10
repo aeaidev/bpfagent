@@ -1,5 +1,2 @@
 [target."cfg(all())"]
 runner = "sudo -E"
-
-[env]
-CC_ENABLE_LINKER_STDERR = "0"

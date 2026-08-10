@@ -2,37 +2,81 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_ktime_get_ns, bpf_probe_read_user_buf},
+    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user_buf},
     macros::{map, tracepoint},
     maps::HashMap,
     programs::TracePointContext,
 };
-use aya_log_ebpf::{debug, error};
-use sca_common::SOCKET_FD_MAP_MAX_ENTRIES;
+use aya_log_ebpf::{debug, error, trace};
+use sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES;
 
-/// Socket file descriptors map
+mod structures;
+use structures::{IoVec, UserMsgHdr};
+
+// SocketHop struct for eBPF - we use a local definition here since aya::Pod
+// is not available in the eBPF context
+// This must match the SocketHop in common/sca/src/lib.rs
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SocketHop {
+    /// Socket FD that receives data
+    pub listening_socket_fd: u32,
+    /// Process ID that sends TO this socket
+    pub sending_process_id: u32,
+    /// Process ID that listens ON this socket
+    pub receiving_process_id: u32,
+}
+
+/// Socket hops map - shared between eBPF and userspace
+/// Key: FD (socket file descriptor)
+/// eBPF reads this to get FD/PID configuration for filtering
+/// The SocketHop struct must be binary compatible between eBPF and userspace
 #[map]
-pub static SOCKET_FD_MAP: HashMap<u32, u8> =
-    HashMap::with_max_entries(SOCKET_FD_MAP_MAX_ENTRIES, 0);
+pub static SOCKET_HOPS_MAP: HashMap<u32, SocketHop> =
+    HashMap::with_max_entries(SOCKET_HOPS_MAP_MAX_ENTRIES, 0);
 
-// Timestamp map: key = (protocol + msg_type), value = timestamp
+/// Counter map to track if tracepoint is being called
+#[map]
+pub static TRACEPOINT_COUNTER: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
+
+/// Get socket hop by FD from SOCKET_HOPS_MAP
+/// Returns None if hop not found
+unsafe fn get_socket_hop_by_fd(fd: u32) -> Option<SocketHop> {
+    // SAFETY: Reading from BPF HashMap map is safe
+    match unsafe { SOCKET_HOPS_MAP.get(&fd) } {
+        Some(hop) => {
+            // Manually copy fields since *hop dereference doesn't work in no_std eBPF
+            Some(SocketHop {
+                listening_socket_fd: hop.listening_socket_fd,
+                sending_process_id: hop.sending_process_id,
+                receiving_process_id: hop.receiving_process_id,
+            })
+        }
+        None => None,
+    }
+}
+
+/// Timestamp map for latency calculation based on NNG Protocol field:
+/// Key: Combined (FD << 32) | Protocol
+/// - When sending process sends TO the socket: store timestamp with combined key
+/// - When receiving process sends FROM the socket: look up timestamp with combined key
 #[map]
 pub static TIMESTAMP_MAP: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 
-/// Max latency per process name (process name -> max latency in ns)
+/// Sum of latencies per PID for moving average calculation
 #[map]
-pub static LATENCY_PNAME_HASH: HashMap<[u8; 16], u64> = HashMap::with_max_entries(16, 0);
+pub static LATENCY_PID_SUM: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
 
-/// Timestamp of last reset for each process name (process name -> timestamp in ns)
+/// Count of samples per PID for moving average calculation
 #[map]
-pub static LATENCY_RESET_TIME: HashMap<[u8; 16], u64> = HashMap::with_max_entries(16, 0);
+pub static LATENCY_PID_COUNT: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
 
-/// 2 seconds in nanoseconds
-const RESET_INTERVAL_NS: u64 = 20_000_000_000;
-
-/// Process names map for filtering
+/// Timestamp of first sample in current window for each PID
 #[map]
-pub static PROCESS_NAMES_MAP: HashMap<[u8; 16], u8> = HashMap::with_max_entries(16, 0);
+pub static LATENCY_WINDOW_START: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
+
+/// Moving average window size: 2 seconds in nanoseconds
+const WINDOW_SIZE_NS: u64 = 20_000_000_000;
 
 /// NNG header sizes
 const NNG_SPF_SIZE: usize = 9; // NNG SPF (Socket Protocol Framework) header
@@ -51,269 +95,404 @@ macro_rules! tracepoint_handler {
     };
 }
 
-// Send syscalls
-tracepoint_handler!(sys_enter_sendmsg, generic_send);
-tracepoint_handler!(sys_enter_sendto, generic_send);
-tracepoint_handler!(sys_enter_write, generic_send);
+// Send syscalls - we only trace send operations for latency calculation
+tracepoint_handler!(sys_enter_sendmsg, sys_enter_sendmsg_handler);
+// tracepoint_handler!(sys_enter_sendto, generic_send);
+// tracepoint_handler!(sys_enter_write, generic_send);
 
-// Receive syscalls
-tracepoint_handler!(sys_enter_recvfrom, generic_receive);
-tracepoint_handler!(sys_enter_read, generic_receive);
-tracepoint_handler!(sys_enter_readv, generic_receive);
+/// Tracepoint handler for sys_enter_sendmsg
+/// Measures latency using NNG Protocol field as key, with socket-based filtering
+///
+/// For each tracked socket hop:
+/// - When sending process sends TO the socket: store timestamp with Protocol key
+/// - When receiving process sends FROM the socket: look up timestamp with Protocol key
+fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
+    trace!(&ctx, "sys_enter_sendmsg_handler() - ENTERED");
 
-/// Generic tracepoint for send syscalls
-fn generic_send(ctx: TracePointContext) -> Result<u32, u32> {
-    // Check if this is an allowed process
-    if !is_allowed_process(&ctx) {
-        return Ok(0);
-    }
+    // cat /sys/kernel/debug/tracing/events/syscalls/sys_enter_sendmsg/format
+    // Argument 0: fd (int) at offset 16
+    // Argument 1: msg (struct user_msghdr __user *) at offset 24
+    // Argument 2: flags (int) at offset 32
 
-    let fd = unsafe { ctx.read_at::<u64>(16).ok() };
-    if let Some(fd) = fd {
-        if is_valid_unix_socket(&ctx, fd as u32) {
-            debug!(ctx, "sent: fd={}", fd);
-            if let Some((buf_ptr, buf_size)) = read_buffer_info(&ctx) {
-                debug!(ctx, "buf_ptr={}, buf_size={}", buf_ptr as u64, buf_size);
-                read_buffer_data(&ctx, buf_ptr, buf_size, fd as u32, true);
-            }
-        }
-    }
-    Ok(0)
-}
-
-/// Generic tracepoint for receive syscalls
-fn generic_receive(ctx: TracePointContext) -> Result<u32, u32> {
-    // Check if this is an allowed process
-    if !is_allowed_process(&ctx) {
-        return Ok(0);
-    }
-
-    let fd = unsafe { ctx.read_at::<u64>(16).ok() };
-    if let Some(fd) = fd {
-        if is_valid_unix_socket(&ctx, fd as u32) {
-            debug!(ctx, "received: fd={}", fd);
-            if let Some((buf_ptr, buf_size)) = read_buffer_info(&ctx) {
-                debug!(ctx, "buf_ptr={}, buf_size={}", buf_ptr as u64, buf_size);
-                read_buffer_data(&ctx, buf_ptr, buf_size, fd as u32, false);
-            }
-        }
-    }
-    Ok(0)
-}
-
-fn is_valid_unix_socket(_ctx: &TracePointContext, fd: u32) -> bool {
-    SOCKET_FD_MAP.get_ptr(&fd).is_some()
-}
-
-fn is_allowed_process(_ctx: &TracePointContext) -> bool {
-    match bpf_get_current_comm() {
-        Ok(comm) => (1..=comm.len()).any(|len| {
-            let mut key: [u8; 16] = [0; 16];
-            key[0..len].copy_from_slice(&comm[0..len]);
-            PROCESS_NAMES_MAP.get_ptr(&key).is_some()
-        }),
-        Err(_) => false,
-    }
-}
-
-/// Read buffer pointer and size from tracepoint context
-fn read_buffer_info(ctx: &TracePointContext) -> Option<(*const u8, usize)> {
+    // Increment counter to track if tracepoint is being called
     unsafe {
-        let buf_ptr: u64 = ctx.read_at(24).ok()?;
-        let buf_size: u64 = ctx.read_at(32).ok()?;
-
-        if buf_ptr == 0 {
-            return None;
-        }
-
-        Some((buf_ptr as *const u8, buf_size as usize))
-    }
-}
-
-/// Read and process NNG packet data
-/// fd: socket file descriptor
-/// is_send: true if send operation, false if receive
-fn read_buffer_data(
-    ctx: &TracePointContext,
-    buf_ptr: *const u8,
-    buf_size: usize,
-    fd: u32,
-    is_send: bool,
-) {
-    unsafe {
-        // Read protocol and message type
-        let protocol = match read_nng_protocol(ctx, buf_ptr, buf_size) {
-            Some(p) => p,
-            None => return,
-        };
-        debug!(ctx, "Protocol: {}", protocol);
-
-        let msg_type = match read_nng_msg_type(ctx, buf_ptr, buf_size) {
-            Some(t) => t,
-            None => return,
-        };
-        debug!(ctx, "Message type: {}", msg_type);
-
-        // Create combined key
-        let key = create_nng_key(protocol, msg_type, is_send);
-        debug!(ctx, "Combined key: {:x}", key);
-
-        // Get current timestamp
-        let timestamp = bpf_ktime_get_ns();
-
-        if is_send {
-            handle_send(ctx, key, timestamp, fd);
+        if let Some(count) = TRACEPOINT_COUNTER.get(&0) {
+            TRACEPOINT_COUNTER.insert(&0, &(count + 1), 0).ok();
         } else {
-            handle_receive(ctx, key, timestamp);
+            TRACEPOINT_COUNTER.insert(&0, &1, 0).ok();
         }
+    }
+
+    let fd = unsafe { ctx.read_at::<u64>(16).ok() };
+    let msg_ptr = unsafe { ctx.read_at::<u64>(24).ok() };
+
+    if let (Some(fd), Some(msg_ptr)) = (fd, msg_ptr) {
+        let fd = fd as u32;
+
+        // Get current process ID for comparison
+        let current_pid = bpf_get_current_pid_tgid() >> 32; // PID is in upper 32 bits
+
+        // Look up the socket hop by FD directly
+        debug!(
+            &ctx,
+            "Looking up socket hop by fd: {} for current_pid: {}", fd, current_pid
+        );
+        let hop_config =
+            match unsafe { get_socket_hop_by_fd(fd) } {
+                Some(hop) => {
+                    debug!(
+                        &ctx,
+                        "Found hop: fd={}, sending_pid={}, receiving_pid={}",
+                        hop.listening_socket_fd,
+                        hop.sending_process_id,
+                        hop.receiving_process_id
+                    );
+                    // Check if current PID matches either the sending or receiving process
+                    if current_pid == hop.sending_process_id as u64
+                        || current_pid == hop.receiving_process_id as u64
+                    {
+                        trace!(
+                            &ctx,
+                            "sys_enter_sendmsg_handler() - current_pid: {}, fd: {}",
+                            current_pid,
+                            hop.listening_socket_fd
+                        );
+                        hop
+                    } else {
+                        debug!(
+                        &ctx,
+                        "PID mismatch: current_pid={} != sending_pid={} and != receiving_pid={}",
+                        current_pid, hop.sending_process_id, hop.receiving_process_id
+                    );
+                        return Ok(0); // PID doesn't match, skip
+                    }
+                }
+                None => {
+                    debug!(&ctx, "No hop found for fd: {}", fd);
+                    return Ok(0); // No hop for this FD, skip
+                }
+            };
+
+        // Read NNG header to get Protocol and Message Type
+        let (protocol, msg_type) = match unsafe {
+            read_nng_protocol_msg_type_from_msghdr(&ctx, msg_ptr as *const UserMsgHdr)
+        } {
+            Some((p, t)) => (p, t),
+            None => return Ok(0), // Not an NNG packet, skip
+        };
+
+        // Determine if this process is the sender or receiver for this socket
+        // and use (FD, Protocol) as the key for timestamp lookup/store
+        if current_pid == hop_config.sending_process_id as u64 {
+            // This process is sending TO the listening socket
+            // Store timestamp with (FD << 32) | Protocol as key
+            unsafe {
+                store_timestamp_with_protocol(&ctx, fd, protocol);
+            }
+        } else if current_pid == hop_config.receiving_process_id as u64 {
+            // This process is sending FROM the listening socket (response)
+            // Look up timestamp with (FD << 32) | Protocol as key, calculate latency
+            let latency = unsafe { lookup_timestamp_with_protocol(&ctx, fd, protocol) };
+            if latency > 0 {
+                let current_time = unsafe { bpf_ktime_get_ns() };
+                unsafe { update_moving_average(&ctx, current_pid as u32, latency, current_time) }
+                debug!(
+                    &ctx,
+                    "Latency for protocol=0x{:x}, msg_type=0x{:x}, {} ns",
+                    protocol,
+                    msg_type,
+                    latency
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// Read a value from user space memory
+unsafe fn bpf_probe_read_user_val<T: Copy>(addr: u64) -> Option<T> {
+    let ptr = addr as *const T;
+    match aya_ebpf::helpers::bpf_probe_read_user(ptr) {
+        Ok(val) => Some(val),
+        Err(_) => None,
     }
 }
 
-/// Read NNG protocol value from buffer
+/// Read NNG protocol and message type directly from user_msghdr
 /// Returns None if buffer is too small or read fails
-unsafe fn read_nng_protocol(
+unsafe fn read_nng_protocol_msg_type_from_msghdr(
     ctx: &TracePointContext,
-    buf_ptr: *const u8,
-    buf_size: usize,
-) -> Option<u32> {
-    const MIN_PROTOCOL_OFFSET: usize = NNG_SPF_SIZE + NNG_PROTOCOL_SIZE;
+    msg_ptr: *const UserMsgHdr,
+) -> Option<(u32, u16)> {
+    let msg_ptr_addr = msg_ptr as u64;
 
-    if buf_size < MIN_PROTOCOL_OFFSET {
-        debug!(ctx, "Buffer too small for NNG protocol: size={}", buf_size);
+    // Read msg_iov from user_msghdr (offset 16: msg_name=0, msg_namelen=4, padding=4, msg_iov=16)
+    let msg_iov: *const IoVec = match bpf_probe_read_user_val(msg_ptr_addr + 16) {
+        Some(val) => val,
+        None => return None,
+    };
+
+    // Read msg_iovlen from user_msghdr (offset 24)
+    let msg_iovlen: usize = match bpf_probe_read_user_val(msg_ptr_addr + 24) {
+        Some(val) => val,
+        None => return None,
+    };
+
+    if msg_iov.is_null() || msg_iovlen == 0 {
         return None;
     }
 
-    let mut protocol_buf: [u8; 4] = [0; 4];
-    let protocol_ptr = buf_ptr.add(NNG_SPF_SIZE);
-    match bpf_probe_read_user_buf(protocol_ptr, &mut protocol_buf) {
-        Ok(()) => Some(u32::from_le_bytes(protocol_buf)),
-        Err(e) => {
-            error!(ctx, "Failed to read protocol: {}", e);
-            None
-        }
-    }
-}
+    // Read the first iovec to get the buffer pointer and size
+    let iov: IoVec = match bpf_probe_read_user_val(msg_iov as u64) {
+        Some(val) => val,
+        None => return None,
+    };
 
-/// Read NNG message type from buffer
-/// Returns None if buffer is too small or read fails
-unsafe fn read_nng_msg_type(
-    ctx: &TracePointContext,
-    buf_ptr: *const u8,
-    buf_size: usize,
-) -> Option<u16> {
-    const MIN_MSG_TYPE_OFFSET: usize = NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE;
-
-    if buf_size < MIN_MSG_TYPE_OFFSET {
-        debug!(
-            ctx,
-            "Buffer too small for NNG message type: size={}", buf_size
+    if iov.iov_base.is_null() {
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - iov.iov_base is null, iov_len: {}",
+            iov.iov_len
         );
         return None;
     }
 
-    let mut msg_type_buf: [u8; 2] = [0; 2];
-    let msg_type_ptr = buf_ptr.add(NNG_SPF_SIZE + NNG_PROTOCOL_SIZE);
-    match bpf_probe_read_user_buf(msg_type_ptr, &mut msg_type_buf) {
-        Ok(()) => Some(u16::from_le_bytes(msg_type_buf)),
-        Err(e) => {
-            error!(ctx, "Failed to read message type: {}", e);
-            None
+    trace!(
+        &ctx,
+        "read_nng_protocol_msg_type_from_msghdr() - iov_base addr: {}, iov_len: {}, msg_iovlen: {}",
+        iov.iov_base as u64,
+        iov.iov_len,
+        msg_iovlen
+    );
+
+    // Check if first iovec has enough data for the full NNG header
+    let header_in_first_iov = iov.iov_len >= NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE;
+
+    if !header_in_first_iov {
+        // Header is not in first iov, try multi iov approach
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - full header not in first iov, iov_len: {} (need {})",
+            iov.iov_len,
+            NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE
+        );
+
+        // Check if we have multiple iovecs and try to read from second one
+        if msg_iovlen < 2 {
+            trace!(&ctx, "read_nng_protocol_msg_type_from_msghdr() - only 1 iov, cannot read header from second iov");
+            return None;
         }
-    }
-}
 
-/// Create combined key from protocol and message type
-/// For send: key = (protocol << 16) | msg_type
-/// For receive: key = (protocol << 16) | (msg_type + 1)
-fn create_nng_key(protocol: u32, msg_type: u16, is_send: bool) -> u64 {
-    if is_send {
-        (protocol as u64) << 16 | (msg_type as u64)
+        // Read second iovec
+        let second_iov_addr = (msg_iov as u64).wrapping_add(core::mem::size_of::<IoVec>() as u64);
+        let second_iov: IoVec = match bpf_probe_read_user_val(second_iov_addr) {
+            Some(val) => val,
+            None => {
+                trace!(
+                    &ctx,
+                    "read_nng_protocol_msg_type_from_msghdr() - failed to read second iov"
+                );
+                return None;
+            }
+        };
+
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - using second iov, iov_len: {}",
+            second_iov.iov_len
+        );
+
+        // Check if second iovec has the protocol
+        if second_iov.iov_len < NNG_PROTOCOL_SIZE {
+            trace!(
+                &ctx,
+                "read_nng_protocol_msg_type_from_msghdr() - second iov too small for protocol: {}",
+                second_iov.iov_len
+            );
+            return None;
+        }
+
+        // Read protocol from second iovec (at offset 0)
+        let protocol_ptr = second_iov.iov_base as *const u8;
+        let mut protocol_buf: [u8; 4] = [0; 4];
+        if bpf_probe_read_user_buf(protocol_ptr, &mut protocol_buf).is_err() {
+            error!(ctx, "Failed to read protocol from second iov");
+            return None;
+        }
+        let protocol = u32::from_be_bytes(protocol_buf);
+
+        // Check if we have a third iovec for message type
+        if msg_iovlen < 3 {
+            trace!(
+                &ctx,
+                "read_nng_protocol_msg_type_from_msghdr() - need third iov for msg_type, only {} iovs",
+                msg_iovlen
+            );
+            return None;
+        }
+
+        // Read third iovec
+        let third_iov_addr =
+            (msg_iov as u64).wrapping_add((core::mem::size_of::<IoVec>() as u64).saturating_mul(2));
+        let third_iov: IoVec = match bpf_probe_read_user_val(third_iov_addr) {
+            Some(val) => val,
+            None => {
+                trace!(
+                    &ctx,
+                    "read_nng_protocol_msg_type_from_msghdr() - failed to read third iov"
+                );
+                return None;
+            }
+        };
+
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - third iov, iov_len: {}",
+            third_iov.iov_len
+        );
+
+        // Check if third iovec has message type (at least 2 bytes)
+        if third_iov.iov_len < NNG_MSG_TYPE_SIZE {
+            trace!(
+                &ctx,
+                "read_nng_protocol_msg_type_from_msghdr() - third iov too small for msg_type: {}",
+                third_iov.iov_len
+            );
+            return None;
+        }
+
+        // Read message type from third iovec (at offset 0)
+        let msg_type_ptr = third_iov.iov_base as *const u8;
+        let mut msg_type_buf: [u8; 2] = [0; 2];
+        if bpf_probe_read_user_buf(msg_type_ptr, &mut msg_type_buf).is_err() {
+            error!(ctx, "Failed to read message type from third iov");
+            return None;
+        }
+        let msg_type = u16::from_be_bytes(msg_type_buf);
+
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - protocol=0x{:x}, msg_type=0x{:x}",
+            protocol,
+            msg_type
+        );
+
+        Some((protocol, msg_type))
     } else {
-        (protocol as u64) << 16 | ((msg_type + 1) as u64)
+        // Header is in first iov, read from offset 9 (after SPF header)
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - full header in first iov, iov_len: {}",
+            iov.iov_len
+        );
+
+        // Read protocol (4 bytes at offset 9 in NNG header)
+        let protocol_ptr = (iov.iov_base as *const u8).wrapping_add(NNG_SPF_SIZE);
+        let mut protocol_buf: [u8; 4] = [0; 4];
+        if bpf_probe_read_user_buf(protocol_ptr, &mut protocol_buf).is_err() {
+            error!(ctx, "Failed to read protocol");
+            return None;
+        }
+        let protocol = u32::from_be_bytes(protocol_buf);
+
+        // Read message type (2 bytes at offset 13 in NNG header)
+        let msg_type_ptr =
+            (iov.iov_base as *const u8).wrapping_add(NNG_SPF_SIZE + NNG_PROTOCOL_SIZE);
+        let mut msg_type_buf: [u8; 2] = [0; 2];
+        if bpf_probe_read_user_buf(msg_type_ptr, &mut msg_type_buf).is_err() {
+            error!(ctx, "Failed to read message type");
+            return None;
+        }
+        let msg_type = u16::from_be_bytes(msg_type_buf);
+
+        trace!(
+            &ctx,
+            "read_nng_protocol_msg_type_from_msghdr() - from first iov: protocol=0x{:x}, msg_type=0x{:x}",
+            protocol,
+            msg_type
+        );
+
+        Some((protocol, msg_type))
     }
 }
 
-/// Get process name as key for latency tracking
-fn get_process_name_key() -> [u8; 16] {
-    let mut key: [u8; 16] = [0; 16];
-    if let Ok(comm) = bpf_get_current_comm() {
-        let len = comm.len().min(16);
-        key[0..len].copy_from_slice(&comm[0..len]);
-    }
-    key
+unsafe fn store_timestamp_with_protocol(_ctx: &TracePointContext, fd: u32, protocol: u32) {
+    let key = (fd as u64) << 32 | (protocol as u64);
+    let timestamp = bpf_ktime_get_ns();
+
+    debug!(
+        _ctx,
+        "Storing timestamp for fd={}, protocol=0x{:x}, key={}", fd, protocol, key
+    );
+    let _ = TIMESTAMP_MAP.insert(&key, &timestamp, 0);
 }
 
-/// Check and reset latency if 2 seconds have elapsed
-unsafe fn check_and_reset_latency_if_needed(
-    ctx: &TracePointContext,
-    pname_key: &[u8; 16],
+unsafe fn lookup_timestamp_with_protocol(ctx: &TracePointContext, fd: u32, protocol: u32) -> u64 {
+    let key = (fd as u64) << 32 | (protocol as u64);
+
+    debug!(
+        &ctx,
+        "Looking up timestamp for fd={}, protocol=0x{:x}, key={}", fd, protocol, key
+    );
+    if let Some(stored_time) = TIMESTAMP_MAP.get(&key) {
+        let current_time = bpf_ktime_get_ns();
+        let latency = current_time - *stored_time;
+        let _ = TIMESTAMP_MAP.remove(&key);
+        debug!(&ctx, "Found latency={}", latency);
+        latency
+    } else {
+        debug!(
+            &ctx,
+            "Timestamp not found for fd={}, protocol=0x{:x}", fd, protocol
+        );
+        0
+    }
+}
+
+/// Update moving average for PID
+/// Maintains a sliding window sum and count to calculate average over time
+unsafe fn update_moving_average(
+    _ctx: &TracePointContext,
+    pid: u32,
+    latency: u64,
     current_time: u64,
 ) {
-    unsafe {
-        match LATENCY_RESET_TIME.get(pname_key) {
-            Some(last_reset_time) => {
-                if current_time - *last_reset_time > RESET_INTERVAL_NS {
-                    LATENCY_PNAME_HASH.insert(pname_key, &0, 0).ok();
-                    LATENCY_RESET_TIME.insert(pname_key, &current_time, 0).ok();
-                    debug!(ctx, "Reset latency for process at time {}", current_time);
-                }
-            }
-            None => {
-                LATENCY_RESET_TIME.insert(pname_key, &current_time, 0).ok();
-            }
-        }
-    }
-}
+    // Get current sum
+    let mut sum = LATENCY_PID_SUM.get(&pid).copied().unwrap_or(0);
 
-/// Update max latency for process
-unsafe fn update_max_latency(ctx: &TracePointContext, pname_key: &[u8; 16], latency: u64) {
-    unsafe {
-        match LATENCY_PNAME_HASH.get(pname_key) {
-            Some(max_latency) => {
-                if latency > *max_latency {
-                    LATENCY_PNAME_HASH.insert(pname_key, &latency, 0).ok();
-                    debug!(ctx, "Updated max latency to {} ns", latency);
-                }
-            }
-            None => {
-                LATENCY_PNAME_HASH.insert(pname_key, &latency, 0).ok();
-                debug!(ctx, "Inserted new entry with {} ns", latency);
-            }
-        }
-    }
-}
+    // Get current count
+    let mut count = LATENCY_PID_COUNT.get(&pid).copied().unwrap_or(0);
 
-/// Handle send operation: calculate latency and update metrics
-unsafe fn handle_send(ctx: &TracePointContext, key: u64, timestamp: u64, fd: u32) {
-    match TIMESTAMP_MAP.get(&key) {
-        Some(req_timestamp) => {
-            let diff = timestamp - *req_timestamp;
-            debug!(ctx, "Latency for fd={}: {} ns", fd, diff);
+    // Get window start time
+    let window_start = LATENCY_WINDOW_START.get(&pid).copied().unwrap_or(0);
 
-            let pname_key = get_process_name_key();
-            check_and_reset_latency_if_needed(ctx, &pname_key, timestamp);
-            update_max_latency(ctx, &pname_key, diff);
-        }
-        None => {
-            debug!(
-                ctx,
-                "No timestamp found for key={:x}, cannot calculate latency", key
-            );
-        }
+    // Check if we need to slide the window (more than WINDOW_SIZE_NS has passed)
+    if current_time - window_start > WINDOW_SIZE_NS {
+        // Reset the window
+        sum = 0;
+        count = 0;
+        LATENCY_WINDOW_START.insert(&pid, &current_time, 0).ok();
+        // debug!(
+        //     ctx,
+        //     "Sliding window reset for PID {} at time {}", pid, current_time
+        // );
+    } else if count == 0 {
+        // First sample in window
+        LATENCY_WINDOW_START.insert(&pid, &current_time, 0).ok();
     }
-    // Clean up the timestamp entry
-    TIMESTAMP_MAP.remove(&key).ok();
-}
 
-/// Handle receive operation: store timestamp for later calculation
-unsafe fn handle_receive(ctx: &TracePointContext, key: u64, timestamp: u64) {
-    match TIMESTAMP_MAP.insert(&key, &timestamp, 0) {
-        Ok(()) => debug!(
-            ctx,
-            "Stored timestamp for key={:x}, timestamp={}", key, timestamp
-        ),
-        Err(e) => error!(ctx, "Failed to store timestamp for key={:x}: {}", key, e),
-    }
+    // Add new latency to sum and increment count
+    sum += latency;
+    count += 1;
+
+    // Update the sum and count
+    LATENCY_PID_SUM.insert(&pid, &sum, 0).ok();
+    LATENCY_PID_COUNT.insert(&pid, &count, 0).ok();
+
+    // debug!(
+    //     ctx,
+    //     "Moving average for PID {}: sum={}, count={}, latency={}", pid, sum, count, latency
+    // );
 }
 
 #[cfg(not(test))]
