@@ -7,6 +7,7 @@
 /// the eBPF program which hop this endpoint belongs to and whether this
 /// endpoint is the hop's sender (store timestamp) or receiver (look up
 /// timestamp and report latency).
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HopEndpoint {
     /// Index into DATA_FLOW identifying the hop
@@ -14,6 +15,8 @@ pub struct HopEndpoint {
     /// 1 if this endpoint is the sending process of the hop, 0 if it is
     /// the receiving (listening) process
     pub is_sender: u32,
+    /// Unix socket path of the hop (NUL-padded, for logging)
+    pub path: [u8; 32],
 }
 
 // Data flow mapping: socket path -> (sending_process_name, receiving_process_name)
@@ -34,7 +37,8 @@ pub const DATA_FLOW: &[(&str, &str, &str)] = &[
 ];
 
 // Implement Pod for HopEndpoint when compiled for userspace with aya
-// This is safe because HopEndpoint is a simple struct of u32 fields
+// This is safe because HopEndpoint is a plain #[repr(C)] struct of
+// integer fields and a byte array
 #[cfg(feature = "user")]
 pub use aya::Pod;
 

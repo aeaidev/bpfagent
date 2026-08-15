@@ -453,9 +453,14 @@ fn populate_socket_hops_map(
             };
 
             let key = ((rec.pid as u64) << 32) | (rec.fd as u64);
+            let mut path_bytes = [0u8; 32];
+            let src = path.as_bytes();
+            let n = src.len().min(32);
+            path_bytes[..n].copy_from_slice(&src[..n]);
             let endpoint = HopEndpoint {
                 hop_index: hop_index as u32,
                 is_sender,
+                path: path_bytes,
             };
             match hops_map.insert(&key, &endpoint, 0) {
                 Ok(()) => {
