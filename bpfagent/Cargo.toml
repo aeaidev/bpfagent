@@ -30,6 +30,9 @@ kfree_skb-common = { path = "../common/kfree_skb" }
 sca-common = { path = "../common/sca", features = ["user"] }
 procfs = { version = "0.15", default-features = false }
 
+[dev-dependencies]
+rand = "0.9"
+
 [build-dependencies]
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }

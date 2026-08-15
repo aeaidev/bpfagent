@@ -12,8 +12,11 @@
 //! Each hop is a lockstep REQ/REP exchange over a persistent connection:
 //! the sender uses sendmsg() to push a message in the NNG-like wire format
 //! (9B SPF | 4B protocol | 2B msg type | 2B size | payload), the receiver
-//! replies on the same connection, also with sendmsg(). Only sendmsg is used
-//! for sending because the SCA eBPF program hooks sys_enter_sendmsg only.
+//! replies on the same connection, also with sendmsg(). The protocol field and
+//! msg type are randomly generated per message; the reply echoes the protocol
+//! id and answers with msg type + 1, as in the real NNG REQ/REP flow. Only
+//! sendmsg is used for sending because the SCA eBPF program hooks
+//! sys_enter_sendmsg only.
 //!
 //! Usage:
 //!   sca_sim            # launcher: spawns all roles, waits, cleans up on exit
@@ -26,9 +29,6 @@ use std::time::Duration;
 
 /// Wire protocol constants (must match what the eBPF program parses).
 const NNG_SPF_SIZE: usize = 9;
-const PROTOCOL: u32 = 0x0000_0001; // REQ/REP protocol id, read by eBPF at offset 9
-const MSG_TYPE_REQ: u16 = 1;
-const MSG_TYPE_REP: u16 = 2;
 /// Fixed message size so recv side can read exact frames on a stream socket.
 const MSG_SIZE: usize = 64;
 
@@ -260,17 +260,20 @@ fn connect_socket(path: &str) -> i32 {
 
 /// Build one fixed-size wire message: 9B SPF | 4B protocol (BE) | 2B type (BE)
 /// | 2B size (BE) | zero payload.
-fn build_message(msg_type: u16) -> [u8; MSG_SIZE] {
+///
+/// `protocol` is a per-message identifier, like in the real components; the
+/// reply must echo the request's value so the agent can match the pair.
+fn build_message(msg_type: u16, protocol: u32) -> [u8; MSG_SIZE] {
     let mut buf = [0u8; MSG_SIZE];
-    buf[NNG_SPF_SIZE..NNG_SPF_SIZE + 4].copy_from_slice(&PROTOCOL.to_be_bytes());
+    buf[NNG_SPF_SIZE..NNG_SPF_SIZE + 4].copy_from_slice(&protocol.to_be_bytes());
     buf[NNG_SPF_SIZE + 4..NNG_SPF_SIZE + 6].copy_from_slice(&msg_type.to_be_bytes());
     buf[NNG_SPF_SIZE + 6..NNG_SPF_SIZE + 8].copy_from_slice(&(MSG_SIZE as u16).to_be_bytes());
     buf
 }
 
 /// Send one message with sendmsg(2) — the only syscall the SCA eBPF hooks.
-fn send_message(fd: i32, msg_type: u16) {
-    let buf = build_message(msg_type);
+fn send_message(fd: i32, msg_type: u16, protocol: u32) {
+    let buf = build_message(msg_type, protocol);
     let iov = libc::iovec {
         iov_base: buf.as_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -297,7 +300,9 @@ fn send_message(fd: i32, msg_type: u16) {
 }
 
 /// Receive exactly one fixed-size message (stream sockets may split reads).
-fn recv_message(fd: i32) {
+/// Returns (protocol, msg_type) so the reply can echo the protocol id and
+/// answer with msg_type + 1, as the real NNG components do.
+fn recv_message(fd: i32) -> (u32, u16) {
     let mut buf = [0u8; MSG_SIZE];
     let mut got = 0usize;
     while got < buf.len() {
@@ -320,6 +325,14 @@ fn recv_message(fd: i32) {
         }
         got += n as usize;
     }
+    let protocol = u32::from_be_bytes([
+        buf[NNG_SPF_SIZE],
+        buf[NNG_SPF_SIZE + 1],
+        buf[NNG_SPF_SIZE + 2],
+        buf[NNG_SPF_SIZE + 3],
+    ]);
+    let msg_type = u16::from_be_bytes([buf[NNG_SPF_SIZE + 4], buf[NNG_SPF_SIZE + 5]]);
+    (protocol, msg_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +347,11 @@ fn run_initiator(role: &Role, out_path: &str) {
     );
     let mut cycle: u64 = 0;
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        send_message(out_fd, MSG_TYPE_REQ);
+        // Both protocol (per-message id) and msg_type are randomly generated
+        // for every request, like in the real components.
+        let protocol = rand::random::<u32>();
+        let msg_type = rand::random::<u16>();
+        send_message(out_fd, msg_type, protocol);
         recv_message(out_fd); // wait for the REP to come all the way back
         cycle += 1;
         if cycle.is_multiple_of(10) {
@@ -401,13 +418,14 @@ fn run_worker(role: &Role) {
         let delay = role.delay;
         std::thread::spawn(move || {
             loop {
-                recv_message(in_fd); // REQ from upstream
+                let (protocol, msg_type) = recv_message(in_fd); // REQ from upstream
                 std::thread::sleep(delay); // simulated component processing time
                 if let Some(out_fd) = out_fd {
-                    send_message(out_fd, MSG_TYPE_REQ); // forward downstream
+                    send_message(out_fd, msg_type, protocol); // forward downstream unchanged
                     recv_message(out_fd); // REP from downstream
                 }
-                send_message(in_fd, MSG_TYPE_REP); // reply upstream
+                // Reply upstream: same protocol id, msg_type + 1 (NNG REQ/REP convention)
+                send_message(in_fd, msg_type.wrapping_add(1), protocol);
             }
         });
     }
