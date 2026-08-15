@@ -1,5 +1,10 @@
 # SCA Re-architecture Implementation Plan
 
+> **Note:** This plan describes the previous fd-based re-architecture and is
+> kept for history. The keying has since been redesigned: `SOCKET_HOPS_MAP` is
+> keyed by `(pid << 32) | fd` and `TIMESTAMP_MAP` by `(hop_index << 32) | Protocol`.
+> See the "Implementation Details" section in SCA_DATA_FLOW.md for the current design.
+
 ## Current Architecture
 - Uses NNG protocol/MSG Type combined key to match REQ/REP pairs
 - Stores timestamp on first send, looks up on second send with key = Protocol + MSG_Type

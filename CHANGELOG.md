@@ -17,16 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Development setup guide
 - Improved error messages with context
 - `.gitignore` with comprehensive ignore rules
+- SCA pipeline simulator example (`bpfagent/examples/sca_sim.rs`) for end-to-end testing
 
 ### Changed
 - Improved code organization with logical modules
 - Enhanced error handling throughout codebase
 - Better logging in daemon mode
 - Refactored daemonization code
+- SCA hop tracking: `SOCKET_HOPS_MAP` is now keyed by `(pid << 32) | fd` with a
+  sender/receiver role, and `TIMESTAMP_MAP` by `(hop_index << 32) | Protocol`,
+  fixing fd-number collisions across processes
+- SCA hop discovery now uses `ss -xp` peer-inode pairing (which also finds the
+  sender-side connected fds) instead of the lsof pipeline
 
 ### Fixed
 - Removed unsafe libc::fflush() calls
 - Fixed error handling in metrics initialization
+- kfree_skb Prometheus counters were inflated by re-adding cumulative map values
+  every display interval; they now increment only by the delta since last read
+- SCA moving-average window was 20 s instead of the documented 2 s
+- SCA process discovery no longer aborts on the first unreadable /proc entry
 
 ## [0.1.0] - 2026-08-07
 

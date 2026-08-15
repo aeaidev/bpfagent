@@ -73,9 +73,9 @@ The SCA program now traces `sys_enter_sendmsg` syscalls on specific Unix domain 
 
 For each tracked socket hop, the program:
 1. Reads the **Protocol field** from the NNG packet payload (offset 9 in the SPF header)
-2. Uses this Protocol value as the key for timestamp tracking
-3. When the sending process sends TO the socket: stores timestamp with Protocol as key
-4. When the receiving process sends FROM that socket: looks up timestamp with Protocol as key
+2. Uses a combined key of **hop index + Protocol** for timestamp tracking
+3. When the sending process sends TO the socket: stores timestamp with `(hop_index << 32) | Protocol` as key
+4. When the receiving process sends FROM that socket: looks up the timestamp with the same key
 5. Calculates latency as: `current_timestamp - stored_timestamp`
 
 #### Socket Hops Configuration
@@ -92,23 +92,30 @@ The following socket hops are configured for latency measurement:
 #### Implementation Details
 
 1. **Socket Hops Map** (`SOCKET_HOPS_MAP`):
-   - Key: socket path string (`[u8; 64]`)
-   - Value: SocketHopInfo with sending/receiving process names
-   - Populated at program load time from `SOCKET_HOPS` configuration
+   - Key: `(pid << 32) | fd` (u64) — unambiguous because fd numbers are per-process
+   - Value: `HopEndpoint { hop_index, is_sender }`
+   - Populated at program load time: each hop contributes up to two entries —
+     the sender's connected fd and the receiver's accepted fd.
+   - Discovery uses `ss -xp` peer-inode pairing: the receiver's accepted socket
+     carries the hop path directly; the sender's connected socket (which has no
+     path of its own) is resolved to a hop via its peer inode.
 
 2. **Timestamp Tracking** (`TIMESTAMP_MAP`):
-   - Key: Protocol (u64) from NNG packet payload
+   - Key: `(hop_index << 32) | Protocol` (u64)
    - Value: timestamp in nanoseconds
-   - When `DATA_SOURCE` sends to `/tmp/DATA_L3_TO_INTERNAL_ROUTER`: stores timestamp with Protocol key
-   - When `INTERNAL_ROUTER` sends from `/tmp/DATA_L3_TO_INTERNAL_ROUTER`: looks up timestamp with Protocol key, calculates latency
+   - When e.g. `DATA_SOURCE` sends to `/tmp/DATA_L3_TO_INTERNAL_ROUTER`: stores
+     timestamp with the hop key
+   - When `INTERNAL_ROUTER` sends back on the same hop: looks up the timestamp
+     with the same key and calculates the latency
 
-3. **Moving Average**: Latencies are tracked using a sliding window (2-second window) with sum and count per process.
+3. **Moving Average**: Latencies are aggregated per receiving PID with a sliding
+   window (2-second window) using sum and count maps.
 
 #### eBPF Map Structure
 
 | Map Name              | Key Type      | Value Type    | Purpose |
 |-----------------------|---------------|---------------|--------|
-| `SOCKET_HOPS_MAP`     | `[u8; 64]`    | `SocketHopInfo` | Maps socket paths to sending/receiving process info |
-| `TIMESTAMP_MAP`       | `u64` (Protocol) | `u64` (timestamp) | Stores timestamps keyed by NNG Protocol field |
-| `LATENCY_PNAME_SUM`   | `[u8; 16]` (process name) | `u64` | Sum of latencies per process |
-| `LATENCY_PNAME_COUNT` | `[u8; 16]` (process name) | `u64` | Count of samples per process |
+| `SOCKET_HOPS_MAP`     | `u64` ((pid << 32) \| fd) | `HopEndpoint` | Maps hop endpoints to (hop index, sender/receiver role) |
+| `TIMESTAMP_MAP`       | `u64` ((hop_index << 32) \| Protocol) | `u64` (timestamp) | Stores timestamps per hop keyed by NNG Protocol field |
+| `LATENCY_PID_SUM`     | `u32` (PID)   | `u64` | Sum of latencies per receiving process |
+| `LATENCY_PID_COUNT`   | `u32` (PID)   | `u64` | Count of samples per receiving process |

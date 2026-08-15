@@ -77,6 +77,28 @@ cargo test -- --nocapture
 cargo test --test integration_test
 ```
 
+### SCA End-to-End Simulation
+
+Run the SCA pipeline simulator (6 processes, 7 Unix-socket hops, NNG-like
+REQ/REP over sendmsg; no root needed):
+
+```bash
+cargo run -p bpfagent --example sca_sim
+```
+
+Then, in another terminal, start the agent — hop discovery happens once at
+load, so the simulator must be running first:
+
+```bash
+sudo ./target/debug/bpfagent
+```
+
+Watch the SCA metrics:
+
+```bash
+watch -n1 'curl -s http://localhost:9101/metrics | grep sca'
+```
+
 ## Debugging
 
 ### Enable Debug Logging

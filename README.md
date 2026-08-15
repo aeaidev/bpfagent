@@ -113,8 +113,8 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - Uses BPF CO-RE compatible types via Aya framework
 - **SCA program** - traces socket communication latency per process
   - Measures latency based on socket path + direction (TO/FROM) matching
-  - On send TO listening socket: stores timestamp with key = socket_path + "TO"
-  - On send FROM listening socket: looks up timestamp with key = socket_path + "FROM"
+  - On send TO listening socket: stores timestamp with key = (hop_index << 32) | Protocol
+  - On send FROM listening socket: looks up timestamp with the same key
   - Calculates latency as timestamp difference on match
   - Tracks moving average latency per process name (2-second sliding window)
   - Exports metrics via Prometheus with process name labels
@@ -290,7 +290,7 @@ scrape_configs:
 ```
 # HELP kfree_skb_total_drops Total number of SKB drops
 # TYPE kfree_skb_total_drops counter
- kotlinx_skb_total_drops{reason="all"} 1234
+ kfree_skb_total_drops{reason="all"} 1234
 # HELP kfree_skb_drops_by_reason Number of drops by reason
 # TYPE kfree_skb_drops_by_reason counter
  kfree_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
@@ -301,16 +301,16 @@ scrape_configs:
 #### SCA
 
 The SCA program calculates latency based on socket path + direction matching:
-- Key format: socket_path + "TO" (for sends to listening socket) or socket_path + "FROM" (for sends from listening socket)
-- On send TO listening socket: stores timestamp
-- On send FROM listening socket: looks up and calculates latency
+- Hop endpoints are tracked in `SOCKET_HOPS_MAP` keyed by `(pid << 32) | fd` (sender's connected fd and receiver's accepted fd, discovered via `ss -xp` peer-inode pairing)
+- On send TO listening socket: stores timestamp with key = `(hop_index << 32) | Protocol`
+- On send FROM listening socket: looks up the timestamp with the same key
 - Latency is calculated as current_timestamp - stored_timestamp on match
 
 ```
-# HELP sca_max_latency_per_pname Maximum latency in microseconds per process name (based on NNG Protocol + Message Type timestamp difference)
-# TYPE sca_max_latency_per_pname gauge
- sca_max_latency_per_pname{pname="INTERNAL_ROUTER"} 150
- sca_max_latency_per_pname{pname="FRAGMENTER"} 280
+# HELP sca_avg_latency_per_pname Average latency in microseconds per process name
+# TYPE sca_avg_latency_per_pname gauge
+ sca_avg_latency_per_pname{pname="INTERNAL_ROUTER (PID 1234)"} 60769
+ sca_avg_latency_per_pname{pname="FRAGMENTER (PID 1237)"} 34985
 ```
 
 ## Output Example
@@ -327,15 +327,15 @@ Drop counts (total: 1234):
 
 ### SCA Output
 
-The SCA program tracks latency based on socket path + direction matching for each hop:
-- On send TO listening socket: stores timestamp
+The SCA program tracks latency per receiving process for each hop:
+- On send TO listening socket: stores timestamp with key = (hop_index << 32) | Protocol
 - On send FROM listening socket: looks up and calculates latency
 - Latency is calculated as current_timestamp - stored_timestamp on match
 
 ```
---- Max Latency per Process Name ---
-  INTERNAL_ROUTER: 150 us
-  FRAGMENTER: 280 us
+--- Moving Average Latency per PID ---
+  INTERNAL_ROUTER (PID 1234): 60769 us (count: 2) path=/tmp/DATA_L3_TO_INTERNAL_ROUTER
+  FRAGMENTER (PID 1237): 34985 us (count: 4) path=/tmp/WF_L_TO_FRAG, /tmp/IRSS_L_TO_FRAG
 ```
 
 ## Mapping Drop Reasons
@@ -356,14 +356,16 @@ The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include
 ```
 bpfagent/
 ├── bpfagent/           # User-space Rust application
-│   └── src/
-│       ├── main.rs     # Application entry point with argument parsing
-│       ├── common.rs   # Shared CLI arguments for bpfagent
-│       ├── config.rs   # Config file parsing and daemon settings
-│       ├── kfree_skb.rs# kfree_skb-specific logic (metrics, display)
-│       ├── sca.rs      # SCA-specific logic (metrics, display)
-│       ├── metrics.rs  # Prometheus metrics HTTP server
-│       └── program.rs  # Generic program traits and registry
+│   ├── src/
+│   │   ├── main.rs     # Application entry point with argument parsing
+│   │   ├── cli/        # Command-line argument definitions
+│   │   ├── config/     # Config file parsing and daemon settings
+│   │   ├── metrics/    # Prometheus metrics HTTP server
+│   │   └── programs/   # Program registry, traits, and eBPF program modules
+│   │       ├── kfree_skb/  # kfree_skb-specific logic (metrics, display)
+│   │       └── sca/        # SCA-specific logic (metrics, display, hop discovery)
+│   └── examples/
+│       └── sca_sim.rs  # SCA pipeline simulator for end-to-end testing
 ├── common/
 │   ├── kfree_skb/      # Shared types between user and eBPF code
 │   └── sca/            # Shared types between user and eBPF code
@@ -376,18 +378,19 @@ bpfagent/
 
 #### kfree_skb
 
-- `bpfagent/src/kfree_skb.rs` - kfree_skb-specific logic (metrics, display functions)
+- `bpfagent/src/programs/kfree_skb/mod.rs` - kfree_skb-specific logic (metrics, display functions)
 - `ebpf/kfree_skb/src/main.rs` - eBPF program attached to `kfree_skb` tracepoint
 - `common/kfree_skb/src/lib.rs` - Common types (`SkbDropReason`, `reason_name`)
 
 #### SCA
 
-- `bpfagent/src/sca.rs` - SCA-specific logic (metrics, display functions)
-- `ebpf/sca/src/main.rs` - eBPF program that matches NNG Protocol + Message Type keys for latency calculation
-- `common/sca/src/lib.rs` - Common types (process names, socket paths, tracepoints)
+- `bpfagent/src/programs/sca/mod.rs` - SCA-specific logic (metrics, display, hop discovery via `ss -xp`)
+- `ebpf/sca/src/main.rs` - eBPF program that matches NNG Protocol timestamps per hop for latency calculation
+- `common/sca/src/lib.rs` - Common types (hop endpoints, data flow, tracepoints)
+- `bpfagent/examples/sca_sim.rs` - SCA pipeline simulator for end-to-end testing
 
 **SCA Latency Calculation:**
-- Uses combined key of Protocol (4B) + Message Type (2B) to match REQ/REP message pairs
-- On receive: stores timestamp with key = Protocol + (MSG_Type + 1)
-- On send: looks up timestamp with key = Protocol + MSG_Type
+- Uses a combined key of hop index (4B) + Protocol (4B) to match REQ/REP message pairs
+- On send TO the listening socket (sender endpoint): stores timestamp with key = (hop_index << 32) | Protocol
+- On send FROM the listening socket (receiver endpoint): looks up timestamp with the same key
 - Latency = current_timestamp - stored_timestamp on match
