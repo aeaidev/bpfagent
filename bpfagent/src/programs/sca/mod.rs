@@ -189,21 +189,11 @@ impl MetricsDisplay for ScaProgram {
             .ok_or_else(|| anyhow::anyhow!("BPF program not loaded"))?;
 
         // Read sum and count from separate maps (PID-based)
-        let sum_map: HashMap<_, u32, u64> = ebpf
-            .map("LATENCY_PID_SUM")
-            .ok_or_else(|| anyhow::anyhow!("LATENCY_PID_SUM not found"))?
-            .try_into()?;
-
-        let count_map: HashMap<_, u32, u64> = ebpf
-            .map("LATENCY_PID_COUNT")
-            .ok_or_else(|| anyhow::anyhow!("LATENCY_PID_COUNT not found"))?
-            .try_into()?;
+        let sum_map = open_pid_map(ebpf, "LATENCY_PID_SUM")?;
+        let count_map = open_pid_map(ebpf, "LATENCY_PID_COUNT")?;
 
         // Check if tracepoint is being called
-        let tracepoint_counter_map: HashMap<_, u32, u64> = ebpf
-            .map("TRACEPOINT_COUNTER")
-            .ok_or_else(|| anyhow::anyhow!("TRACEPOINT_COUNTER not found"))?
-            .try_into()?;
+        let tracepoint_counter_map = open_pid_map(ebpf, "TRACEPOINT_COUNTER")?;
         match tracepoint_counter_map.get(&0, 0) {
             Ok(count) => trace!("TRACEPOINT_COUNTER: {}", count),
             Err(_) => trace!("TRACEPOINT_COUNTER: 0 (no entries)"),
@@ -211,60 +201,17 @@ impl MetricsDisplay for ScaProgram {
 
         info!("--- Moving Average Latency per PID ---");
 
-        // Get all PIDs from the maps and calculate averages
-        let mut all_pids: HashSet<u32> = HashSet::new();
-        for result in sum_map.iter() {
-            let (pid, _) =
-                result.map_err(|e| anyhow::anyhow!("Failed to iterate LATENCY_PID_SUM: {}", e))?;
-            all_pids.insert(pid);
-        }
-        for result in count_map.iter() {
-            let (pid, _) = result
-                .map_err(|e| anyhow::anyhow!("Failed to iterate LATENCY_PID_COUNT: {}", e))?;
-            all_pids.insert(pid);
-        }
-
-        for pid in all_pids {
+        for pid in collect_pids(&sum_map, &count_map)? {
             let sum = sum_map.get(&pid, 0).unwrap_or(0);
             let count = count_map.get(&pid, 0).unwrap_or(0);
-
-            // Calculate average latency
-            let avg_latency = if count > 0 { sum / count } else { 0 };
-            let avg_latency_us = avg_latency / 1000; // convert nano to micro
-
-            // Get process name from socket_pid_map, default to "unknown"
-            let process_name = self
-                .socket_pid_map
-                .get(&pid)
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-
-            // Get the hop socket path(s) this PID receives on, if available
-            let socket_path = self
-                .socket_path_map
-                .get(&pid)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            info!(
-                "  {} (PID {}): {} us (count: {}){}",
-                process_name,
+            report_pid_latency(
+                metrics,
+                &self.socket_pid_map,
+                &self.socket_path_map,
                 pid,
-                avg_latency_us,
+                sum,
                 count,
-                if !socket_path.is_empty() {
-                    format!(" path={}", socket_path)
-                } else {
-                    String::new()
-                }
             );
-
-            // Update Prometheus metrics with average latency in microseconds
-            let label = format!("{} (PID {})", process_name, pid);
-            metrics
-                .avg_latency_per_pname
-                .with_label_values(&[&label])
-                .set(avg_latency_us as i64);
         }
 
         debug!("Displaying moving average latency per PID");
@@ -355,37 +302,86 @@ pub fn parse_ss_unix_stream(output: &str) -> Vec<UnixSockRec> {
     recs
 }
 
-/**
- * Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries.
- *
- * Discovery uses `ss -xp` peer-inode pairing:
- * - The receiver's accepted socket carries the hop path directly.
- * - The sender's connected socket has no path of its own; it is resolved to a
- *   hop via its peer inode, which is the receiver's accepted socket.
- *
- * Also populates socket_path_map and socket_pid_map for metrics display.
- */
-fn populate_socket_hops_map(
-    socket_path_map: &mut std::collections::HashMap<u32, String>,
-    socket_pid_map: &mut std::collections::HashMap<u32, String>,
-    ebpf: &mut Ebpf,
-) -> anyhow::Result<()> {
-    debug!("Populating SOCKET_HOPS_MAP from running processes via ss");
+/// Open a u32 -> u64 BPF hash map by name.
+fn open_pid_map<'a>(
+    ebpf: &'a Ebpf,
+    name: &str,
+) -> anyhow::Result<HashMap<&'a aya::maps::MapData, u32, u64>> {
+    ebpf.map(name)
+        .ok_or_else(|| anyhow::anyhow!("{} map not found", name))?
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("failed to open {} map: {}", name, e))
+}
 
-    // Get all PIDs from DATA_FLOW by reading /proc/*/comm
-    let mut process_pid_map: std::collections::HashMap<&str, u32> =
-        std::collections::HashMap::new();
-    for (_socket_path, sending, receiving) in sca_common::DATA_FLOW {
-        for &process_name in &[sending, receiving] {
-            if !process_pid_map.contains_key(process_name) {
+/// Collect all PIDs present in either latency map.
+fn collect_pids(
+    sum_map: &HashMap<&aya::maps::MapData, u32, u64>,
+    count_map: &HashMap<&aya::maps::MapData, u32, u64>,
+) -> anyhow::Result<HashSet<u32>> {
+    let mut pids = HashSet::new();
+    for result in sum_map.iter().chain(count_map.iter()) {
+        let (pid, _) =
+            result.map_err(|e| anyhow::anyhow!("failed to iterate latency maps: {}", e))?;
+        pids.insert(pid);
+    }
+    Ok(pids)
+}
+
+/// Compute the moving average latency for a PID, print it, and update the gauge.
+fn report_pid_latency(
+    metrics: &ScaMetrics,
+    socket_pid_map: &std::collections::HashMap<u32, String>,
+    socket_path_map: &std::collections::HashMap<u32, String>,
+    pid: u32,
+    sum: u64,
+    count: u64,
+) {
+    let avg_latency_us = sum.checked_div(count).unwrap_or(0) / 1000; // ns -> us
+
+    let process_name = socket_pid_map
+        .get(&pid)
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let socket_path = socket_path_map.get(&pid).map(String::as_str).unwrap_or("");
+
+    info!(
+        "  {} (PID {}): {} us (count: {}){}",
+        process_name,
+        pid,
+        avg_latency_us,
+        count,
+        if !socket_path.is_empty() {
+            format!(" path={}", socket_path)
+        } else {
+            String::new()
+        }
+    );
+
+    let label = format!("{} (PID {})", process_name, pid);
+    metrics
+        .avg_latency_per_pname
+        .with_label_values(&[&label])
+        .set(avg_latency_us as i64);
+}
+
+/// Resolve the PIDs of all processes named in DATA_FLOW by scanning /proc.
+fn collect_data_flow_pids() -> std::collections::HashMap<&'static str, u32> {
+    let mut pids = std::collections::HashMap::new();
+    for &(_socket_path, sending, receiving) in sca_common::DATA_FLOW {
+        for process_name in [sending, receiving] {
+            if let std::collections::hash_map::Entry::Vacant(entry) = pids.entry(process_name) {
                 if let Some(pid) = get_pid_by_process_name(process_name) {
-                    process_pid_map.insert(process_name, pid);
+                    entry.insert(pid);
                     info!("Found PID {} for process {}", pid, process_name);
                 }
             }
         }
     }
+    pids
+}
 
+/// Run `ss -xpH` and parse the established Unix stream sockets.
+fn query_established_unix_sockets() -> anyhow::Result<Vec<UnixSockRec>> {
     let output = std::process::Command::new("ss")
         .arg("-xpH")
         .output()
@@ -396,14 +392,98 @@ fn populate_socket_hops_map(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let recs = parse_ss_unix_stream(&stdout);
+    Ok(parse_ss_unix_stream(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
 
-    // inode -> path, for resolving the peer of path-less client sockets
-    let path_by_inode: std::collections::HashMap<u64, &str> = recs
+/// Build an inode -> path index, used to resolve the peer of path-less
+/// client sockets.
+pub fn paths_by_inode(sockets: &[UnixSockRec]) -> std::collections::HashMap<u64, &str> {
+    sockets
         .iter()
-        .filter_map(|r| r.path.as_deref().map(|p| (r.inode, p)))
-        .collect();
+        .filter_map(|s| s.path.as_deref().map(|p| (s.inode, p)))
+        .collect()
+}
+
+/// Decide whether `sock` is an endpoint of the hop between `s_pid` and `r_pid`
+/// on `path`, and if so, with which role.
+///
+/// Returns Some(1) for the sender endpoint and Some(0) for the receiver:
+/// the receiver's accepted socket carries the hop path directly, while the
+/// sender's connected socket has no path of its own and is resolved via its
+/// peer inode (the receiver's accepted socket).
+pub fn endpoint_role(
+    sock: &UnixSockRec,
+    s_pid: u32,
+    r_pid: u32,
+    path: &str,
+    path_by_inode: &std::collections::HashMap<u64, &str>,
+) -> Option<u32> {
+    if sock.pid == r_pid && sock.path.as_deref() == Some(path) {
+        Some(0)
+    } else if sock.pid == s_pid
+        && sock.path.is_none()
+        && path_by_inode.get(&sock.peer_inode) == Some(&path)
+    {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Insert one (pid, fd) -> HopEndpoint entry into SOCKET_HOPS_MAP.
+/// Returns true on success.
+fn insert_endpoint(
+    hops_map: &mut HashMap<&mut aya::maps::MapData, u64, HopEndpoint>,
+    hop_index: u32,
+    sock: &UnixSockRec,
+    is_sender: u32,
+    path: &str,
+) -> bool {
+    let key = ((sock.pid as u64) << 32) | (sock.fd as u64);
+    let mut path_bytes = [0u8; 32];
+    let n = path.len().min(32);
+    path_bytes[..n].copy_from_slice(&path.as_bytes()[..n]);
+    let endpoint = HopEndpoint {
+        hop_index,
+        is_sender,
+        path: path_bytes,
+    };
+    match hops_map.insert(&key, &endpoint, 0) {
+        Ok(()) => {
+            info!(
+                "Added hop {} endpoint: pid={}, fd={}, is_sender={}, path={}",
+                hop_index, sock.pid, sock.fd, is_sender, path
+            );
+            true
+        }
+        Err(e) => {
+            error!(
+                "Failed to insert hop {} endpoint (pid={}, fd={}): {}",
+                hop_index, sock.pid, sock.fd, e
+            );
+            false
+        }
+    }
+}
+
+/**
+ * Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries.
+ *
+ * Discovery uses `ss -xp` peer-inode pairing (see endpoint_role).
+ * Also populates socket_path_map and socket_pid_map for metrics display.
+ */
+fn populate_socket_hops_map(
+    socket_path_map: &mut std::collections::HashMap<u32, String>,
+    socket_pid_map: &mut std::collections::HashMap<u32, String>,
+    ebpf: &mut Ebpf,
+) -> anyhow::Result<()> {
+    debug!("Populating SOCKET_HOPS_MAP from running processes via ss");
+
+    let process_pid_map = collect_data_flow_pids();
+    let sockets = query_established_unix_sockets()?;
+    let path_by_inode = paths_by_inode(&sockets);
 
     let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
         return Err(anyhow::anyhow!("SOCKET_HOPS_MAP not found"));
@@ -437,43 +517,9 @@ fn populate_socket_hops_map(
             .or_insert_with(|| path.to_string());
 
         let mut found = false;
-        for rec in &recs {
-            let is_sender = if rec.pid == r_pid && rec.path.as_deref() == Some(*path) {
-                Some(0u32) // receiver endpoint: accepted socket carries the path
-            } else if rec.pid == s_pid
-                && rec.path.is_none()
-                && path_by_inode.get(&rec.peer_inode) == Some(path)
-            {
-                Some(1u32) // sender endpoint: connected socket, resolved via peer
-            } else {
-                None
-            };
-            let Some(is_sender) = is_sender else {
-                continue;
-            };
-
-            let key = ((rec.pid as u64) << 32) | (rec.fd as u64);
-            let mut path_bytes = [0u8; 32];
-            let src = path.as_bytes();
-            let n = src.len().min(32);
-            path_bytes[..n].copy_from_slice(&src[..n]);
-            let endpoint = HopEndpoint {
-                hop_index: hop_index as u32,
-                is_sender,
-                path: path_bytes,
-            };
-            match hops_map.insert(&key, &endpoint, 0) {
-                Ok(()) => {
-                    info!(
-                        "Added hop {} endpoint: pid={}, fd={}, is_sender={}, path={}",
-                        hop_index, rec.pid, rec.fd, is_sender, path
-                    );
-                    found = true;
-                }
-                Err(e) => error!(
-                    "Failed to insert hop {} endpoint (pid={}, fd={}): {}",
-                    hop_index, rec.pid, rec.fd, e
-                ),
+        for sock in &sockets {
+            if let Some(role) = endpoint_role(sock, s_pid, r_pid, path, &path_by_inode) {
+                found |= insert_endpoint(&mut hops_map, hop_index as u32, sock, role, path);
             }
         }
         if !found {

@@ -2,4 +2,4 @@
 
 pub mod server;
 
-pub use server::run_metrics_server;
+pub use server::{handle_http_request, run_metrics_server};

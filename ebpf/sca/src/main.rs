@@ -3,13 +3,14 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user_buf,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user,
+        bpf_probe_read_user_buf,
     },
     macros::{map, tracepoint},
     maps::HashMap,
     programs::TracePointContext,
 };
-use aya_log_ebpf::{debug, error, trace};
+use aya_log_ebpf::{debug, trace};
 use sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES;
 
 mod structures;
@@ -72,10 +73,12 @@ pub static LATENCY_WINDOW_START: HashMap<u32, u64> = HashMap::with_max_entries(1
 /// Moving average window size: 2 seconds in nanoseconds
 const WINDOW_SIZE_NS: u64 = 2_000_000_000;
 
-/// NNG header sizes
+/// NNG header field sizes
 const NNG_SPF_SIZE: usize = 9; // NNG SPF (Socket Protocol Framework) header
 const NNG_PROTOCOL_SIZE: usize = 4; // Protocol type (REQ/REP)
 const NNG_MSG_TYPE_SIZE: usize = 2; // Message type
+/// Total NNG header: SPF | protocol | message type
+const NNG_HEADER_SIZE: usize = NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE;
 
 /// Tracepoint handler macro
 macro_rules! tracepoint_handler {
@@ -104,14 +107,8 @@ tracepoint_handler!(sys_enter_sendmsg, sys_enter_sendmsg_handler);
 /// - When the hop's receiving process sends FROM the socket (response): look up
 ///   the timestamp with the same key and calculate the latency
 fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
-    // trace!(&ctx, "sys_enter_sendmsg_handler() - ENTERED");
-
-    // cat /sys/kernel/debug/tracing/events/syscalls/sys_enter_sendmsg/format
-    // Argument 0: fd (int) at offset 16
-    // Argument 1: msg (struct user_msghdr __user *) at offset 24
-    // Argument 2: flags (int) at offset 32
-
-    // Increment counter to track if tracepoint is being called
+    // Syscall arguments (see /sys/kernel/tracing/events/syscalls/sys_enter_sendmsg/format):
+    // fd at offset 16, msg (struct user_msghdr *) at offset 24, flags at offset 32
     unsafe {
         if let Some(count) = TRACEPOINT_COUNTER.get(&0) {
             TRACEPOINT_COUNTER.insert(&0, &(count + 1), 0).ok();
@@ -143,10 +140,8 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
         let mut path_buf = [0u8; 32];
         let sock_path = buf_to_log_str(&endpoint.path, &mut path_buf);
 
-        // Read NNG header to get Protocol and Message Type
-        let (protocol, msg_type) = match unsafe {
-            read_nng_protocol_msg_type_from_msghdr(&ctx, msg_ptr as *const UserMsgHdr)
-        } {
+        // Read the NNG header to get the protocol and message type
+        let (protocol, msg_type) = match unsafe { read_nng_header(msg_ptr as *const UserMsgHdr) } {
             Some((p, t)) => (p, t),
             None => return Ok(0), // Not an NNG packet, skip
         };
@@ -191,13 +186,82 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Read a value from user space memory
-unsafe fn bpf_probe_read_user_val<T: Copy>(addr: u64) -> Option<T> {
-    let ptr = addr as *const T;
-    match aya_ebpf::helpers::bpf_probe_read_user(ptr) {
-        Ok(val) => Some(val),
-        Err(_) => None,
+/// Read a value from user-space memory.
+unsafe fn read_user<T: Copy>(addr: u64) -> Option<T> {
+    bpf_probe_read_user(addr as *const T).ok()
+}
+
+/// Read a big-endian u32 from user-space memory.
+unsafe fn read_be_u32(addr: u64) -> Option<u32> {
+    let mut buf = [0u8; NNG_PROTOCOL_SIZE];
+    bpf_probe_read_user_buf(addr as *const u8, &mut buf).ok()?;
+    Some(u32::from_be_bytes(buf))
+}
+
+/// Read a big-endian u16 from user-space memory.
+unsafe fn read_be_u16(addr: u64) -> Option<u16> {
+    let mut buf = [0u8; NNG_MSG_TYPE_SIZE];
+    bpf_probe_read_user_buf(addr as *const u8, &mut buf).ok()?;
+    Some(u16::from_be_bytes(buf))
+}
+
+/// Read the iovec at `index` from a user-space iovec array.
+unsafe fn read_iov_at(iov_array: *const IoVec, index: u64) -> Option<IoVec> {
+    let addr = (iov_array as u64).wrapping_add(index * (core::mem::size_of::<IoVec>() as u64));
+    read_user(addr)
+}
+
+/// Read the NNG protocol and message type from a sendmsg() user_msghdr.
+/// Returns None when the message does not carry a readable NNG header.
+unsafe fn read_nng_header(msg_ptr: *const UserMsgHdr) -> Option<(u32, u16)> {
+    let msghdr: UserMsgHdr = read_user(msg_ptr as u64)?;
+    if msghdr.msg_iov.is_null() || msghdr.msg_iovlen == 0 {
+        return None;
     }
+
+    let first_iov = read_iov_at(msghdr.msg_iov, 0)?;
+    if first_iov.iov_base.is_null() {
+        return None;
+    }
+
+    if first_iov.iov_len >= NNG_HEADER_SIZE {
+        // The whole NNG header sits in the first iovec.
+        read_header_from_single_iov(&first_iov)
+    } else {
+        // The header is split across iovecs: SPF in the first, protocol in
+        // the second, message type in the third.
+        read_header_from_split_iovs(msghdr.msg_iov, msghdr.msg_iovlen)
+    }
+}
+
+/// Read the NNG header from a first iovec that contains it entirely.
+unsafe fn read_header_from_single_iov(iov: &IoVec) -> Option<(u32, u16)> {
+    let base = iov.iov_base as u64;
+    let protocol = read_be_u32(base.wrapping_add(NNG_SPF_SIZE as u64))?;
+    let msg_type = read_be_u16(base.wrapping_add((NNG_SPF_SIZE + NNG_PROTOCOL_SIZE) as u64))?;
+    Some((protocol, msg_type))
+}
+
+/// Read the NNG header when it is split across three iovecs:
+/// SPF header in the first, protocol in the second, message type in the third.
+unsafe fn read_header_from_split_iovs(
+    iov_array: *const IoVec,
+    iov_count: usize,
+) -> Option<(u32, u16)> {
+    if iov_count < 3 {
+        return None;
+    }
+    let second = read_iov_at(iov_array, 1)?;
+    if second.iov_base.is_null() || second.iov_len < NNG_PROTOCOL_SIZE {
+        return None;
+    }
+    let third = read_iov_at(iov_array, 2)?;
+    if third.iov_base.is_null() || third.iov_len < NNG_MSG_TYPE_SIZE {
+        return None;
+    }
+    let protocol = read_be_u32(second.iov_base as u64)?;
+    let msg_type = read_be_u16(third.iov_base as u64)?;
+    Some((protocol, msg_type))
 }
 
 /// Copy a NUL-padded buffer (kernel comm, socket path) into a fixed-size,
@@ -216,204 +280,7 @@ fn buf_to_log_str<'a, const N: usize>(buf: &[u8; N], out: &'a mut [u8; N]) -> &'
     unsafe { core::str::from_utf8_unchecked(&out[..]) }
 }
 
-/// Read NNG protocol and message type directly from user_msghdr
-/// Returns None if buffer is too small or read fails
-unsafe fn read_nng_protocol_msg_type_from_msghdr(
-    ctx: &TracePointContext,
-    msg_ptr: *const UserMsgHdr,
-) -> Option<(u32, u16)> {
-    let msg_ptr_addr = msg_ptr as u64;
-
-    // Read msg_iov from user_msghdr (offset 16: msg_name=0, msg_namelen=4, padding=4, msg_iov=16)
-    let msg_iov: *const IoVec = match bpf_probe_read_user_val(msg_ptr_addr + 16) {
-        Some(val) => val,
-        None => return None,
-    };
-
-    // Read msg_iovlen from user_msghdr (offset 24)
-    let msg_iovlen: usize = match bpf_probe_read_user_val(msg_ptr_addr + 24) {
-        Some(val) => val,
-        None => return None,
-    };
-
-    if msg_iov.is_null() || msg_iovlen == 0 {
-        return None;
-    }
-
-    // Read the first iovec to get the buffer pointer and size
-    let iov: IoVec = match bpf_probe_read_user_val(msg_iov as u64) {
-        Some(val) => val,
-        None => return None,
-    };
-
-    if iov.iov_base.is_null() {
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - iov.iov_base is null, iov_len: {}",
-            iov.iov_len
-        );
-        return None;
-    }
-
-    trace!(
-        &ctx,
-        "read_nng_protocol_msg_type_from_msghdr() - iov_base addr: {}, iov_len: {}, msg_iovlen: {}",
-        iov.iov_base as u64,
-        iov.iov_len,
-        msg_iovlen
-    );
-
-    // Check if first iovec has enough data for the full NNG header
-    let header_in_first_iov = iov.iov_len >= NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE;
-
-    if !header_in_first_iov {
-        // Header is not in first iov, try multi iov approach
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - full header not in first iov, iov_len: {} (need {})",
-            iov.iov_len,
-            NNG_SPF_SIZE + NNG_PROTOCOL_SIZE + NNG_MSG_TYPE_SIZE
-        );
-
-        // Check if we have multiple iovecs and try to read from second one
-        if msg_iovlen < 2 {
-            // trace!(&ctx, "read_nng_protocol_msg_type_from_msghdr() - only 1 iov, cannot read header from second iov");
-            return None;
-        }
-
-        // Read second iovec
-        let second_iov_addr = (msg_iov as u64).wrapping_add(core::mem::size_of::<IoVec>() as u64);
-        let second_iov: IoVec = match bpf_probe_read_user_val(second_iov_addr) {
-            Some(val) => val,
-            None => {
-                trace!(
-                    &ctx,
-                    "read_nng_protocol_msg_type_from_msghdr() - failed to read second iov"
-                );
-                return None;
-            }
-        };
-
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - using second iov, iov_len: {}",
-            second_iov.iov_len
-        );
-
-        // Check if second iovec has the protocol
-        if second_iov.iov_len < NNG_PROTOCOL_SIZE {
-            trace!(
-                &ctx,
-                "read_nng_protocol_msg_type_from_msghdr() - second iov too small for protocol: {}",
-                second_iov.iov_len
-            );
-            return None;
-        }
-
-        // Read protocol from second iovec (at offset 0)
-        let protocol_ptr = second_iov.iov_base as *const u8;
-        let mut protocol_buf: [u8; 4] = [0; 4];
-        if bpf_probe_read_user_buf(protocol_ptr, &mut protocol_buf).is_err() {
-            error!(ctx, "Failed to read protocol from second iov");
-            return None;
-        }
-        let protocol = u32::from_be_bytes(protocol_buf);
-
-        // Check if we have a third iovec for message type
-        if msg_iovlen < 3 {
-            trace!(
-                &ctx,
-                "read_nng_protocol_msg_type_from_msghdr() - need third iov for msg_type, only {} iovs",
-                msg_iovlen
-            );
-            return None;
-        }
-
-        // Read third iovec
-        let third_iov_addr =
-            (msg_iov as u64).wrapping_add((core::mem::size_of::<IoVec>() as u64).saturating_mul(2));
-        let third_iov: IoVec = match bpf_probe_read_user_val(third_iov_addr) {
-            Some(val) => val,
-            None => {
-                trace!(
-                    &ctx,
-                    "read_nng_protocol_msg_type_from_msghdr() - failed to read third iov"
-                );
-                return None;
-            }
-        };
-
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - third iov, iov_len: {}",
-            third_iov.iov_len
-        );
-
-        // Check if third iovec has message type (at least 2 bytes)
-        if third_iov.iov_len < NNG_MSG_TYPE_SIZE {
-            trace!(
-                &ctx,
-                "read_nng_protocol_msg_type_from_msghdr() - third iov too small for msg_type: {}",
-                third_iov.iov_len
-            );
-            return None;
-        }
-
-        // Read message type from third iovec (at offset 0)
-        let msg_type_ptr = third_iov.iov_base as *const u8;
-        let mut msg_type_buf: [u8; 2] = [0; 2];
-        if bpf_probe_read_user_buf(msg_type_ptr, &mut msg_type_buf).is_err() {
-            error!(ctx, "Failed to read message type from third iov");
-            return None;
-        }
-        let msg_type = u16::from_be_bytes(msg_type_buf);
-
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - protocol=0x{:x}, msg_type=0x{:x}",
-            protocol,
-            msg_type
-        );
-
-        Some((protocol, msg_type))
-    } else {
-        // Header is in first iov, read from offset 9 (after SPF header)
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - full header in first iov, iov_len: {}",
-            iov.iov_len
-        );
-
-        // Read protocol (4 bytes at offset 9 in NNG header)
-        let protocol_ptr = (iov.iov_base as *const u8).wrapping_add(NNG_SPF_SIZE);
-        let mut protocol_buf: [u8; 4] = [0; 4];
-        if bpf_probe_read_user_buf(protocol_ptr, &mut protocol_buf).is_err() {
-            error!(ctx, "Failed to read protocol");
-            return None;
-        }
-        let protocol = u32::from_be_bytes(protocol_buf);
-
-        // Read message type (2 bytes at offset 13 in NNG header)
-        let msg_type_ptr =
-            (iov.iov_base as *const u8).wrapping_add(NNG_SPF_SIZE + NNG_PROTOCOL_SIZE);
-        let mut msg_type_buf: [u8; 2] = [0; 2];
-        if bpf_probe_read_user_buf(msg_type_ptr, &mut msg_type_buf).is_err() {
-            error!(ctx, "Failed to read message type");
-            return None;
-        }
-        let msg_type = u16::from_be_bytes(msg_type_buf);
-
-        trace!(
-            &ctx,
-            "read_nng_protocol_msg_type_from_msghdr() - from first iov: protocol=0x{:x}, msg_type=0x{:x}",
-            protocol,
-            msg_type
-        );
-
-        Some((protocol, msg_type))
-    }
-}
-
+/// Store the send timestamp for a (hop, protocol) pair.
 unsafe fn store_timestamp_with_protocol(ctx: &TracePointContext, hop_index: u32, protocol: u32) {
     let key = ((hop_index as u64) << 32) | (protocol as u64);
     let timestamp = bpf_ktime_get_ns();
@@ -427,6 +294,8 @@ unsafe fn store_timestamp_with_protocol(ctx: &TracePointContext, hop_index: u32,
     let _ = TIMESTAMP_MAP.insert(&key, &timestamp, 0);
 }
 
+/// Look up and remove the timestamp for a (hop, protocol) pair.
+/// Returns the latency since the stored send, or 0 if there is no match.
 unsafe fn lookup_timestamp_with_protocol(
     ctx: &TracePointContext,
     hop_index: u32,

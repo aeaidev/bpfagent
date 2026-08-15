@@ -54,7 +54,7 @@ pub async fn run_metrics_server(
     Ok(())
 }
 
-fn handle_http_request(
+pub fn handle_http_request(
     stream: &mut std::net::TcpStream,
     registry: &Registry,
 ) -> anyhow::Result<()> {
