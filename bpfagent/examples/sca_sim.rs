@@ -1,5 +1,5 @@
 //! SCA system simulator — simulates the data flow pipeline described in
-//! SCA_DATA_FLOW.md for testing the bpfagent SCA eBPF program.
+//! docs/SCA_DATA_FLOW.md for testing the bpfagent SCA eBPF program.
 //!
 //! Spawns one OS process per component (DATA_SOURCE, INTERNAL_ROUTER,
 //! RED_WF_COMM_L, FRAGMENTER, RED_IRSS_COMM_L, DATA_SINK) with the process
@@ -139,10 +139,11 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 }
 
 fn install_signal_handlers() {
+    let handler = handle_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
-        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handle_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
     }
 }
 
@@ -336,7 +337,7 @@ fn run_initiator(role: &Role, out_path: &str) {
         send_message(out_fd, MSG_TYPE_REQ);
         recv_message(out_fd); // wait for the REP to come all the way back
         cycle += 1;
-        if cycle % 10 == 0 {
+        if cycle.is_multiple_of(10) {
             log(role.name, &format!("{} cycles completed", cycle));
         }
         std::thread::sleep(CYCLE_INTERVAL);

@@ -76,6 +76,9 @@ pub struct KfreeSkbProgram {
     name: String,
     ebpf: Option<Ebpf>,
     metrics: Option<KfreeSkbMetrics>,
+    /// Last cumulative count seen per drop reason, used to compute deltas
+    /// for the Prometheus counters
+    last_counts: std::collections::HashMap<u32, u64>,
 }
 
 impl KfreeSkbProgram {
@@ -85,6 +88,7 @@ impl KfreeSkbProgram {
             name: "kfree_skb".to_string(),
             ebpf: None,
             metrics: None,
+            last_counts: std::collections::HashMap::new(),
         }
     }
 
@@ -145,6 +149,18 @@ impl EbpfProgram for KfreeSkbProgram {
     }
 }
 
+/// Compute the Prometheus increment for a cumulative counter read from the BPF
+/// map: the difference since the last value seen for this reason (0 if the
+/// value went backwards, e.g. after a map reset). Updates `last_counts`.
+pub fn counter_delta(
+    last_counts: &mut std::collections::HashMap<u32, u64>,
+    reason: u32,
+    count: u64,
+) -> u64 {
+    let prev = last_counts.insert(reason, count).unwrap_or(0);
+    count.saturating_sub(prev)
+}
+
 impl MetricsDisplay for KfreeSkbProgram {
     fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
         let metrics = KfreeSkbMetrics::new(registry)?;
@@ -184,20 +200,33 @@ impl MetricsDisplay for KfreeSkbProgram {
         if all_counts.is_empty() {
             trace!("No drops recorded yet");
         } else {
-            let total: u64 = all_counts.iter().map(|(_, _, c)| *c).sum();
-            metrics
-                .total_drops
-                .with_label_values(&["all"])
-                .inc_by(total);
-
-            info!("Drop counts (total: {}):", total);
+            // The BPF map holds cumulative counts since program load, so
+            // increment the Prometheus counters only by the delta since the
+            // last read; adding the full totals on every tick would count
+            // each drop multiple times.
+            let mut total_delta = 0u64;
             for (reason, name, count) in &all_counts {
-                info!("  {:3} ({:30}): {}", reason, name, count);
-                // Update Prometheus metrics
+                let delta = counter_delta(&mut self.last_counts, *reason, *count);
+                if delta == 0 {
+                    continue;
+                }
+                total_delta += delta;
                 metrics
                     .drops_by_reason
                     .with_label_values(&[&reason.to_string(), &name.to_string()])
-                    .inc_by(*count);
+                    .inc_by(delta);
+            }
+            if total_delta > 0 {
+                metrics
+                    .total_drops
+                    .with_label_values(&["all"])
+                    .inc_by(total_delta);
+            }
+
+            let total: u64 = all_counts.iter().map(|(_, _, c)| *c).sum();
+            info!("Drop counts (total: {}):", total);
+            for (reason, name, count) in &all_counts {
+                info!("  {:3} ({:30}): {}", reason, name, count);
             }
         }
 

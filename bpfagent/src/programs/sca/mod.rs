@@ -3,13 +3,20 @@
 //! This module provides a BPF program that traces socket communication latency
 //! by measuring the timestamp difference between NNG protocol messages.
 //!
-//! The eBPF program attaches to various tracepoints (sendmsg, write, etc.) and
-//! uses a key of Protocol to match REQ/REP message pairs on Unix domain sockets.
+//! The eBPF program attaches to sys_enter_sendmsg and uses the NNG Protocol
+//! field plus the hop index to match REQ/REP message pairs on Unix domain
+//! sockets.
 //!
 //! # Latency Calculation
 //!
-//! - First send (to listening socket): stores timestamp with key = Protocol
-//! - Second send (from listening socket as response): looks up with same Protocol key
+//! - Hop endpoints are tracked in SOCKET_HOPS_MAP keyed by (pid << 32) | fd,
+//!   which is unambiguous because fd numbers are per-process. Each hop has a
+//!   sender endpoint (its connected fd) and a receiver endpoint (its accepted
+//!   fd). Userspace discovers both via `ss -xp` peer-inode pairing.
+//! - First send (sender sends TO the listening socket): stores timestamp with
+//!   key = (hop_index << 32) | Protocol
+//! - Second send (receiver sends FROM the listening socket as response): looks
+//!   up the timestamp with the same key
 //! - Latency is calculated as the timestamp difference on match
 //!
 //! # Moving Average
@@ -34,10 +41,10 @@ use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 /// Module re-exports for convenience
 use sca_common;
 
-/// SocketHop type from common - used for both userspace and eBPF
+/// HopEndpoint type from common - used for both userspace and eBPF
 /// The struct layout must match between userspace and eBPF
 /// Since both define it as #[repr(C)] with the same u32 fields, they are binary compatible
-pub use sca_common::SocketHop;
+pub use sca_common::HopEndpoint;
 
 /// Prometheus metrics for SCA program
 pub struct ScaMetrics {
@@ -76,8 +83,8 @@ pub struct ScaProgram {
     name: String,
     ebpf: Option<Ebpf>,
     metrics: Option<ScaMetrics>,
-    /// Mapping of FD to socket path for display metrics
-    socket_fd_map: std::collections::HashMap<u32, String>,
+    /// Mapping of PID to the hop socket path(s) it receives on, for display
+    socket_path_map: std::collections::HashMap<u32, String>,
     /// Mapping of PID to process name for display metrics
     socket_pid_map: std::collections::HashMap<u32, String>,
 }
@@ -89,7 +96,7 @@ impl ScaProgram {
             name: "sca".to_string(),
             ebpf: None,
             metrics: None,
-            socket_fd_map: std::collections::HashMap::new(),
+            socket_path_map: std::collections::HashMap::new(),
             socket_pid_map: std::collections::HashMap::new(),
         }
     }
@@ -117,14 +124,12 @@ impl EbpfProgram for ScaProgram {
             "/sca"
         )))?;
 
-        debug!("Loaded BPF program, pre-populating SOCKET_HOPS_MAP...");
+        debug!("Loaded BPF program, populating SOCKET_HOPS_MAP...");
 
-        // Pre-populate SOCKET_HOPS_MAP with default values based on DATA_FLOW
-        prepopulate_socket_hops_map(&mut ebpf)?;
-
-        // Populate socket fd map from running processes
-        // This also populates socket_fd_map and socket_pid_map for metrics display
-        populate_socket_fd_map(&mut self.socket_fd_map, &mut self.socket_pid_map, &mut ebpf)?;
+        // Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries
+        // discovered from running processes. Also populates socket_path_map
+        // and socket_pid_map for metrics display.
+        populate_socket_hops_map(&mut self.socket_path_map, &mut self.socket_pid_map, &mut ebpf)?;
 
         debug!("SOCKET_HOPS_MAP populated, now attaching tracepoints...");
 
@@ -234,12 +239,11 @@ impl MetricsDisplay for ScaProgram {
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
 
-            // Get socket path if available
+            // Get the hop socket path(s) this PID receives on, if available
             let socket_path = self
-                .socket_fd_map
-                .iter()
-                .find(|(_, path)| path.contains(&format!("{}", pid)))
-                .map(|(_, path)| path.as_str())
+                .socket_path_map
+                .get(&pid)
+                .map(|s| s.as_str())
                 .unwrap_or("");
 
             info!(
@@ -285,36 +289,90 @@ pub fn init(registry: &mut ProgramRegistry) {
     registry.register("sca", || Box::new(ScaProgram::new()));
 }
 
-/**
- * Pre-populate SOCKET_HOPS_MAP with default (zeroed) values based on DATA_FLOW configuration.
- * This ensures the map has entries for all configured socket hops, even if FDs aren't found yet.
- */
-fn prepopulate_socket_hops_map(_ebpf: &mut Ebpf) -> anyhow::Result<()> {
-    // SOCKET_HOPS_MAP is now populated directly in populate_socket_fd_map
-    // This function is kept for potential future pre-initialization if needed
-    Ok(())
+/// One established Unix stream socket parsed from `ss -xpH` output.
+pub struct UnixSockRec {
+    pub pid: u32,
+    pub fd: u32,
+    pub inode: u64,
+    pub peer_inode: u64,
+    /// Bound path if the socket has one; the connected (client) side has none
+    pub path: Option<String>,
+}
+
+/// Parse the users:((...)) column of ss output into (pid, fd) pairs.
+/// Format: users:(("NAME",pid=123,fd=4),("NAME2",pid=456,fd=7))
+pub fn parse_ss_users(users: &str) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut rest = users;
+    while let Some(pos) = rest.find("pid=") {
+        rest = &rest[pos + 4..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(pid) = digits.parse::<u32>() else {
+            break;
+        };
+        let Some(fd_pos) = rest.find("fd=") else {
+            break;
+        };
+        rest = &rest[fd_pos + 3..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(fd) = digits.parse::<u32>() else {
+            break;
+        };
+        out.push((pid, fd));
+    }
+    out
+}
+
+/// Parse `ss -xpH` output into established Unix stream socket records.
+///
+/// Line format (9+ whitespace-separated fields):
+/// u_str ESTAB Recv-Q Send-Q <path|*> <inode> * <peer-inode> users:((...))
+pub fn parse_ss_unix_stream(output: &str) -> Vec<UnixSockRec> {
+    let mut recs = Vec::new();
+    for line in output.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.len() < 9 || t[0] != "u_str" || t[1] != "ESTAB" {
+            continue;
+        }
+        let (Ok(inode), Ok(peer_inode)) = (t[5].parse::<u64>(), t[7].parse::<u64>()) else {
+            continue;
+        };
+        let path = if t[4] == "*" {
+            None
+        } else {
+            Some(t[4].to_string())
+        };
+        for (pid, fd) in parse_ss_users(&t[8..].join(" ")) {
+            recs.push(UnixSockRec {
+                pid,
+                fd,
+                inode,
+                peer_inode,
+                path: path.clone(),
+            });
+        }
+    }
+    recs
 }
 
 /**
- * Populate SOCKET_HOPS_MAP with file descriptors from Unix sockets.
- * Reads lsof output to find socket FDs and their associated PIDs,
- * then populates SOCKET_HOPS_MAP with FD/PID configurations.
+ * Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries.
  *
- * The SOCKET_HOPS_MAP BPF map is shared between eBPF and userspace.
- * Userspace populates SOCKET_HOPS_MAP with FD/PID configurations,
- * eBPF reads from SOCKET_HOPS_MAP to get hop configurations.
+ * Discovery uses `ss -xp` peer-inode pairing:
+ * - The receiver's accepted socket carries the hop path directly.
+ * - The sender's connected socket has no path of its own; it is resolved to a
+ *   hop via its peer inode, which is the receiver's accepted socket.
  *
- * Also populates local socket_fd_map and socket_pid_map for metrics display.
+ * Also populates socket_path_map and socket_pid_map for metrics display.
  */
-fn populate_socket_fd_map(
-    socket_fd_map: &mut std::collections::HashMap<u32, String>,
+fn populate_socket_hops_map(
+    socket_path_map: &mut std::collections::HashMap<u32, String>,
     socket_pid_map: &mut std::collections::HashMap<u32, String>,
     ebpf: &mut Ebpf,
 ) -> anyhow::Result<()> {
-    debug!("Populating SOCKET_HOPS_MAP with Unix socket fds from running processes");
+    debug!("Populating SOCKET_HOPS_MAP from running processes via ss");
 
     // Get all PIDs from DATA_FLOW by reading /proc/*/comm
-    // We need to collect PIDs for both sending and receiving processes
     let mut process_pid_map: std::collections::HashMap<&str, u32> =
         std::collections::HashMap::new();
     for (_socket_path, sending, receiving) in sca_common::DATA_FLOW {
@@ -328,150 +386,97 @@ fn populate_socket_fd_map(
         }
     }
 
-    // Run lsof to get socket FDs from running processes
-    // Parse PID, FD, and socket path from lsof output
-    // Format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-    // Filter for type=STREAM (CONNECTED) Unix sockets only
-    // The TYPE info is in fields 10-11: 'type=STREAM (CONNECTED)'
-    // Note: FD is in field 4, socket path is in field 9
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"sudo -n lsof 2>/dev/null | awk '$4 ~ /u$/ && $10 ~ /type=STREAM/ && $11 ~ /CONNECTED/ {gsub(/u$/,"",$4); print "PID:"$2" FD:"$4" "$9}' | grep -E '/tmp/(DATA_L3_TO|DATA_L_TO|WF_L_TO|FRAG_TO|IRSS_L_TO)'"#)
+    let output = std::process::Command::new("ss")
+        .arg("-xpH")
         .output()
-        .map_err(|e| anyhow::anyhow!("Failed to run lsof command: {}", e))?;
-
+        .map_err(|e| anyhow::anyhow!("Failed to run ss -xpH: {}", e))?;
     if !output.status.success() {
         warn!(
-            "lsof command failed, stdout: {}, stderr: {:?}",
-            String::from_utf8_lossy(&output.stdout),
+            "ss -xpH failed, stderr: {:?} — SCA hop discovery may be incomplete",
             String::from_utf8_lossy(&output.stderr)
         );
-        // Continue anyway - the map might be empty but not an error
     }
-
-    // Debug: log the raw lsof output
-    debug!(
-        "Raw lsof output: stdout='{}', stderr='{}'",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Parse lsof output and build FD -> (pid, socket_path) map
-    // Only include FDs that belong to interesting processes from DATA_FLOW
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut fd_to_info: std::collections::HashMap<u32, (u32, String)> =
-        std::collections::HashMap::new();
+    let recs = parse_ss_unix_stream(&stdout);
 
-    for line in stdout.lines() {
-        // Parse lines like: "PID:1234 FD:5 /tmp/DATA_L3_TO_INTERNAL_ROUTER"
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            // Extract PID
-            let pid_part = parts.get(0).unwrap_or(&"");
-            let pid_str = pid_part.strip_prefix("PID:").unwrap_or("");
-            let pid = pid_str.parse::<u32>().ok();
+    // inode -> path, for resolving the peer of path-less client sockets
+    let path_by_inode: std::collections::HashMap<u64, &str> = recs
+        .iter()
+        .filter_map(|r| r.path.as_deref().map(|p| (r.inode, p)))
+        .collect();
 
-            // Extract FD
-            let fd_part = parts.get(1).unwrap_or(&"");
-            let fd_str = fd_part.strip_prefix("FD:").unwrap_or("");
-            let fd = fd_str.parse::<u32>().ok();
+    let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
+        return Err(anyhow::anyhow!("SOCKET_HOPS_MAP not found"));
+    };
+    let mut hops_map: HashMap<_, u64, HopEndpoint> = map
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
 
-            // Extract socket path
-            let socket_path = parts.get(2).unwrap_or(&"").to_string();
+    for (hop_index, (path, sending, receiving)) in sca_common::DATA_FLOW.iter().enumerate() {
+        let (Some(&s_pid), Some(&r_pid)) = (
+            process_pid_map.get(sending),
+            process_pid_map.get(receiving),
+        ) else {
+            warn!(
+                "Skipping hop {} ({}): {} or {} not running",
+                hop_index, path, sending, receiving
+            );
+            continue;
+        };
 
-            if let (Some(pid), Some(fd)) = (pid, fd) {
-                // Check if this PID is one of the interesting processes from DATA_FLOW
-                let is_interesting = sca_common::DATA_FLOW.iter().any(|(_, sending, receiving)| {
-                    process_pid_map.get(sending) == Some(&pid)
-                        || process_pid_map.get(receiving) == Some(&pid)
-                });
-
-                if is_interesting {
-                    fd_to_info.insert(fd, (pid, socket_path.clone()));
-                    info!("Found FD {} (PID {}) for path {}", fd, pid, socket_path);
+        socket_pid_map.insert(s_pid, sending.to_string());
+        socket_pid_map.insert(r_pid, receiving.to_string());
+        socket_path_map
+            .entry(r_pid)
+            .and_modify(|p| {
+                if !p.is_empty() {
+                    p.push_str(", ");
                 }
-            }
-        }
-    }
+                p.push_str(path);
+            })
+            .or_insert_with(|| path.to_string());
 
-    debug!("Found {} interesting socket FDs", fd_to_info.len());
-    debug!("fd_to_info contents: {:?}", fd_to_info);
-
-    // Populate SOCKET_HOPS_MAP
-    // Use FD as the key for direct lookup in eBPF
-    let socket_hops_map_name = "SOCKET_HOPS_MAP";
-
-    // Get reference to the map
-    if let Some(map) = ebpf.map_mut(socket_hops_map_name) {
-        debug!("SOCKET_HOPS_MAP found");
-        // Convert to HashMap to work with it
-        let mut hops_map: HashMap<_, u32, SocketHop> = map
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
-
-        debug!(
-            "SOCKET_HOPS_MAP max entries: {}",
-            sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES
-        );
-
-        debug!(
-            "About to insert {} entries into SOCKET_HOPS_MAP",
-            fd_to_info.len()
-        );
-
-        for (fd, (_pid, socket_path)) in fd_to_info.iter() {
-            // For each socket path, we need to determine sending and receiving PIDs
-            // We'll use the DATA_FLOW configuration to find matching entries
-            for (_hop_key, (flow_path, sending, receiving)) in
-                sca_common::DATA_FLOW.iter().enumerate()
+        let mut found = false;
+        for rec in &recs {
+            let is_sender = if rec.pid == r_pid && rec.path.as_deref() == Some(*path) {
+                Some(0u32) // receiver endpoint: accepted socket carries the path
+            } else if rec.pid == s_pid
+                && rec.path.is_none()
+                && path_by_inode.get(&rec.peer_inode) == Some(path)
             {
-                if *flow_path == socket_path.as_str() {
-                    // Get the actual PIDs for sending and receiving processes
-                    let s_pid = process_pid_map.get(sending).copied();
-                    let r_pid = process_pid_map.get(receiving).copied();
+                Some(1u32) // sender endpoint: connected socket, resolved via peer
+            } else {
+                None
+            };
+            let Some(is_sender) = is_sender else {
+                continue;
+            };
 
-                    if let (Some(s_pid), Some(r_pid)) = (s_pid, r_pid) {
-                        // Update local socket_fd_map with FD -> path mapping
-                        socket_fd_map.insert(*fd, socket_path.clone());
-                        info!("Added to socket_fd_map: fd={} -> path={}", fd, socket_path);
-
-                        // Update local socket_pid_map with PID -> process name mapping
-                        // Names are used in display metrics only
-                        socket_pid_map.insert(s_pid, sending.to_string());
-                        socket_pid_map.insert(r_pid, receiving.to_string());
-                        info!(
-                            "Added to socket_pid_map: s_pid={} -> {}, r_pid={} -> {}",
-                            s_pid, sending, r_pid, receiving
-                        );
-
-                        // Create the hop with the FD and PIDs
-                        let hop = SocketHop {
-                            listening_socket_fd: *fd,
-                            sending_process_id: s_pid,
-                            receiving_process_id: r_pid,
-                        };
-
-                        // Write to SOCKET_HOPS_MAP using FD as the key
-                        debug!(
-                            "Attempting to insert hop with fd {} into SOCKET_HOPS_MAP",
-                            fd
-                        );
-                        match hops_map.insert(fd, &hop, 0) {
-                            Ok(()) => info!(
-                                "Added to SOCKET_HOPS_MAP with fd {}: sending_pid={}, receiving_pid={}, path={}",
-                                fd, s_pid, r_pid, socket_path
-                            ),
-                            Err(e) => error!(
-                                "Failed to insert hop with fd {} into SOCKET_HOPS_MAP: {}",
-                                fd, e
-                            ),
-                        };
-                    }
+            let key = ((rec.pid as u64) << 32) | (rec.fd as u64);
+            let endpoint = HopEndpoint {
+                hop_index: hop_index as u32,
+                is_sender,
+            };
+            match hops_map.insert(&key, &endpoint, 0) {
+                Ok(()) => {
+                    info!(
+                        "Added hop {} endpoint: pid={}, fd={}, is_sender={}, path={}",
+                        hop_index, rec.pid, rec.fd, is_sender, path
+                    );
+                    found = true;
                 }
+                Err(e) => error!(
+                    "Failed to insert hop {} endpoint (pid={}, fd={}): {}",
+                    hop_index, rec.pid, rec.fd, e
+                ),
             }
         }
-    } else {
-        warn!("SOCKET_HOPS_MAP not found");
+        if !found {
+            warn!(
+                "No endpoints found for hop {} ({}): sockets of {} (pid {}) / {} (pid {}) not visible",
+                hop_index, path, sending, s_pid, receiving, r_pid
+            );
+        }
     }
     Ok(())
 }
@@ -479,7 +484,10 @@ fn populate_socket_fd_map(
 /// Get PID from process name by reading /proc/*/comm
 fn get_pid_by_process_name(process_name: &str) -> Option<u32> {
     for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
+        // Skip unreadable entries instead of aborting the whole scan
+        let Ok(entry) = entry else {
+            continue;
+        };
         let dir_name = entry.file_name();
         let pid_str = dir_name.to_string_lossy();
 

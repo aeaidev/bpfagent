@@ -13,53 +13,49 @@ use sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES;
 mod structures;
 use structures::{IoVec, UserMsgHdr};
 
-// SocketHop struct for eBPF - we use a local definition here since aya::Pod
+// HopEndpoint struct for eBPF - we use a local definition here since aya::Pod
 // is not available in the eBPF context
-// This must match the SocketHop in common/sca/src/lib.rs
+// This must match the HopEndpoint in common/sca/src/lib.rs
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct SocketHop {
-    /// Socket FD that receives data
-    pub listening_socket_fd: u32,
-    /// Process ID that sends TO this socket
-    pub sending_process_id: u32,
-    /// Process ID that listens ON this socket
-    pub receiving_process_id: u32,
+pub struct HopEndpoint {
+    /// Index into DATA_FLOW identifying the hop
+    pub hop_index: u32,
+    /// 1 if this endpoint is the hop's sending process, 0 if it is the receiver
+    pub is_sender: u32,
 }
 
 /// Socket hops map - shared between eBPF and userspace
-/// Key: FD (socket file descriptor)
-/// eBPF reads this to get FD/PID configuration for filtering
-/// The SocketHop struct must be binary compatible between eBPF and userspace
+/// Key: (pid << 32) | fd — unambiguous because fd numbers are per-process
+/// Value: HopEndpoint (hop index + sender/receiver role)
+/// Userspace populates this with one entry per hop endpoint:
+/// the sender's connected fd and the receiver's accepted fd.
 #[map]
-pub static SOCKET_HOPS_MAP: HashMap<u32, SocketHop> =
+pub static SOCKET_HOPS_MAP: HashMap<u64, HopEndpoint> =
     HashMap::with_max_entries(SOCKET_HOPS_MAP_MAX_ENTRIES, 0);
+
+/// Look up the hop endpoint for a given process and file descriptor.
+/// Returns None if this (pid, fd) pair is not part of any tracked hop.
+unsafe fn get_endpoint(pid: u32, fd: u32) -> Option<HopEndpoint> {
+    let key = ((pid as u64) << 32) | (fd as u64);
+    // SAFETY: Reading from BPF HashMap map is safe
+    match unsafe { SOCKET_HOPS_MAP.get(&key) } {
+        Some(ep) => Some(HopEndpoint {
+            hop_index: ep.hop_index,
+            is_sender: ep.is_sender,
+        }),
+        None => None,
+    }
+}
 
 /// Counter map to track if tracepoint is being called
 #[map]
 pub static TRACEPOINT_COUNTER: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
-/// Get socket hop by FD from SOCKET_HOPS_MAP
-/// Returns None if hop not found
-unsafe fn get_socket_hop_by_fd(fd: u32) -> Option<SocketHop> {
-    // SAFETY: Reading from BPF HashMap map is safe
-    match unsafe { SOCKET_HOPS_MAP.get(&fd) } {
-        Some(hop) => {
-            // Manually copy fields since *hop dereference doesn't work in no_std eBPF
-            Some(SocketHop {
-                listening_socket_fd: hop.listening_socket_fd,
-                sending_process_id: hop.sending_process_id,
-                receiving_process_id: hop.receiving_process_id,
-            })
-        }
-        None => None,
-    }
-}
-
 /// Timestamp map for latency calculation based on NNG Protocol field:
-/// Key: Combined (FD << 32) | Protocol
-/// - When sending process sends TO the socket: store timestamp with combined key
-/// - When receiving process sends FROM the socket: look up timestamp with combined key
+/// Key: (hop_index << 32) | Protocol
+/// - When the hop's sending process sends TO the socket: store timestamp
+/// - When the hop's receiving process sends FROM the socket: look up timestamp
 #[map]
 pub static TIMESTAMP_MAP: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 
@@ -76,7 +72,7 @@ pub static LATENCY_PID_COUNT: HashMap<u32, u64> = HashMap::with_max_entries(16, 
 pub static LATENCY_WINDOW_START: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
 
 /// Moving average window size: 2 seconds in nanoseconds
-const WINDOW_SIZE_NS: u64 = 20_000_000_000;
+const WINDOW_SIZE_NS: u64 = 2_000_000_000;
 
 /// NNG header sizes
 const NNG_SPF_SIZE: usize = 9; // NNG SPF (Socket Protocol Framework) header
@@ -101,11 +97,14 @@ tracepoint_handler!(sys_enter_sendmsg, sys_enter_sendmsg_handler);
 // tracepoint_handler!(sys_enter_write, generic_send);
 
 /// Tracepoint handler for sys_enter_sendmsg
-/// Measures latency using NNG Protocol field as key, with socket-based filtering
+/// Measures per-hop latency using the NNG Protocol field, with socket filtering
+/// based on (pid, fd) endpoint lookup.
 ///
 /// For each tracked socket hop:
-/// - When sending process sends TO the socket: store timestamp with Protocol key
-/// - When receiving process sends FROM the socket: look up timestamp with Protocol key
+/// - When the hop's sending process sends TO the socket: store timestamp with
+///   (hop_index << 32) | Protocol as key
+/// - When the hop's receiving process sends FROM the socket (response): look up
+///   the timestamp with the same key and calculate the latency
 fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     trace!(&ctx, "sys_enter_sendmsg_handler() - ENTERED");
 
@@ -129,49 +128,24 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     if let (Some(fd), Some(msg_ptr)) = (fd, msg_ptr) {
         let fd = fd as u32;
 
-        // Get current process ID for comparison
-        let current_pid = bpf_get_current_pid_tgid() >> 32; // PID is in upper 32 bits
+        // Get current process ID; PID is in the upper 32 bits
+        let current_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
-        // Look up the socket hop by FD directly
+        // Look up the hop endpoint by (pid, fd). fd numbers are per-process,
+        // so the pair is unambiguous even when two processes use the same
+        // numeric fd for different sockets.
+        let endpoint = match unsafe { get_endpoint(current_pid, fd) } {
+            Some(ep) => ep,
+            None => return Ok(0), // Not a tracked endpoint, skip
+        };
         debug!(
             &ctx,
-            "Looking up socket hop by fd: {} for current_pid: {}", fd, current_pid
+            "Found endpoint: pid={}, fd={}, hop={}, is_sender={}",
+            current_pid,
+            fd,
+            endpoint.hop_index,
+            endpoint.is_sender
         );
-        let hop_config =
-            match unsafe { get_socket_hop_by_fd(fd) } {
-                Some(hop) => {
-                    debug!(
-                        &ctx,
-                        "Found hop: fd={}, sending_pid={}, receiving_pid={}",
-                        hop.listening_socket_fd,
-                        hop.sending_process_id,
-                        hop.receiving_process_id
-                    );
-                    // Check if current PID matches either the sending or receiving process
-                    if current_pid == hop.sending_process_id as u64
-                        || current_pid == hop.receiving_process_id as u64
-                    {
-                        trace!(
-                            &ctx,
-                            "sys_enter_sendmsg_handler() - current_pid: {}, fd: {}",
-                            current_pid,
-                            hop.listening_socket_fd
-                        );
-                        hop
-                    } else {
-                        debug!(
-                        &ctx,
-                        "PID mismatch: current_pid={} != sending_pid={} and != receiving_pid={}",
-                        current_pid, hop.sending_process_id, hop.receiving_process_id
-                    );
-                        return Ok(0); // PID doesn't match, skip
-                    }
-                }
-                None => {
-                    debug!(&ctx, "No hop found for fd: {}", fd);
-                    return Ok(0); // No hop for this FD, skip
-                }
-            };
 
         // Read NNG header to get Protocol and Message Type
         let (protocol, msg_type) = match unsafe {
@@ -181,24 +155,23 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
             None => return Ok(0), // Not an NNG packet, skip
         };
 
-        // Determine if this process is the sender or receiver for this socket
-        // and use (FD, Protocol) as the key for timestamp lookup/store
-        if current_pid == hop_config.sending_process_id as u64 {
-            // This process is sending TO the listening socket
-            // Store timestamp with (FD << 32) | Protocol as key
+        if endpoint.is_sender == 1 {
+            // This process is sending TO the listening socket: store timestamp
             unsafe {
-                store_timestamp_with_protocol(&ctx, fd, protocol);
+                store_timestamp_with_protocol(&ctx, endpoint.hop_index, protocol);
             }
-        } else if current_pid == hop_config.receiving_process_id as u64 {
-            // This process is sending FROM the listening socket (response)
-            // Look up timestamp with (FD << 32) | Protocol as key, calculate latency
-            let latency = unsafe { lookup_timestamp_with_protocol(&ctx, fd, protocol) };
+        } else {
+            // This process is sending FROM the listening socket (response):
+            // look up the timestamp and calculate latency
+            let latency =
+                unsafe { lookup_timestamp_with_protocol(&ctx, endpoint.hop_index, protocol) };
             if latency > 0 {
                 let current_time = unsafe { bpf_ktime_get_ns() };
-                unsafe { update_moving_average(&ctx, current_pid as u32, latency, current_time) }
+                unsafe { update_moving_average(&ctx, current_pid, latency, current_time) }
                 debug!(
                     &ctx,
-                    "Latency for protocol=0x{:x}, msg_type=0x{:x}, {} ns",
+                    "Latency for hop={}, protocol=0x{:x}, msg_type=0x{:x}, {} ns",
+                    endpoint.hop_index,
                     protocol,
                     msg_type,
                     latency
@@ -416,23 +389,27 @@ unsafe fn read_nng_protocol_msg_type_from_msghdr(
     }
 }
 
-unsafe fn store_timestamp_with_protocol(_ctx: &TracePointContext, fd: u32, protocol: u32) {
-    let key = (fd as u64) << 32 | (protocol as u64);
+unsafe fn store_timestamp_with_protocol(_ctx: &TracePointContext, hop_index: u32, protocol: u32) {
+    let key = ((hop_index as u64) << 32) | (protocol as u64);
     let timestamp = bpf_ktime_get_ns();
 
     debug!(
         _ctx,
-        "Storing timestamp for fd={}, protocol=0x{:x}, key={}", fd, protocol, key
+        "Storing timestamp for hop={}, protocol=0x{:x}, key={}", hop_index, protocol, key
     );
     let _ = TIMESTAMP_MAP.insert(&key, &timestamp, 0);
 }
 
-unsafe fn lookup_timestamp_with_protocol(ctx: &TracePointContext, fd: u32, protocol: u32) -> u64 {
-    let key = (fd as u64) << 32 | (protocol as u64);
+unsafe fn lookup_timestamp_with_protocol(
+    ctx: &TracePointContext,
+    hop_index: u32,
+    protocol: u32,
+) -> u64 {
+    let key = ((hop_index as u64) << 32) | (protocol as u64);
 
     debug!(
         &ctx,
-        "Looking up timestamp for fd={}, protocol=0x{:x}, key={}", fd, protocol, key
+        "Looking up timestamp for hop={}, protocol=0x{:x}, key={}", hop_index, protocol, key
     );
     if let Some(stored_time) = TIMESTAMP_MAP.get(&key) {
         let current_time = bpf_ktime_get_ns();
@@ -443,7 +420,7 @@ unsafe fn lookup_timestamp_with_protocol(ctx: &TracePointContext, fd: u32, proto
     } else {
         debug!(
             &ctx,
-            "Timestamp not found for fd={}, protocol=0x{:x}", fd, protocol
+            "Timestamp not found for hop={}, protocol=0x{:x}", hop_index, protocol
         );
         0
     }
