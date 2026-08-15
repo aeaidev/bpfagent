@@ -17,14 +17,16 @@ Run `./scripts/setup.sh` to install everything.
 bpfagent/
 ├── bpfagent/              # User-space application
 │   ├── src/
-│   │   ├── main.rs        # Application entry point
+│   │   ├── main.rs        # Thin binary entry point
+│   │   ├── lib.rs         # Library root (all modules live here)
+│   │   ├── app.rs         # Program wiring and main event loop
+│   │   ├── daemon.rs      # Daemonization logic
 │   │   ├── cli/           # Command-line argument parsing
 │   │   ├── config/        # Configuration loading
 │   │   ├── programs/      # eBPF program management
-│   │   ├── daemon/        # Daemonization logic
-│   │   ├── metrics/       # Prometheus metrics
-│   │   └── error.rs       # Error types
-│   └── tests/             # Integration tests
+│   │   └── metrics/       # Prometheus metrics
+│   ├── examples/          # sca_sim.rs: SCA pipeline simulator
+│   └── tests/             # Integration and unit tests
 │
 ├── common/                # Shared types between eBPF and userspace
 │   ├── kfree_skb/

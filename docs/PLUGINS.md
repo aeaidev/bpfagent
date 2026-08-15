@@ -11,6 +11,9 @@ A plugin consists of three parts:
 
 ## Quick Start
 
+A complete, copy-ready program template is also available at
+[`docs/templates/custom_program.rs`](templates/custom_program.rs).
+
 ### 1. Create eBPF Program Directory
 
 ```bash
@@ -141,21 +144,20 @@ impl EbpfProgram for MyProgram {
 
 ### 4. Register the Program
 
-Edit `bpfagent/src/programs/mod.rs`:
+Add the module in `bpfagent/src/programs/mod.rs`:
 ```rust
-pub mod my_program;
-
-pub fn init(registry: &mut ProgramRegistry) {
-    kfree_skb::init(registry);
-    sca::init(registry);
-    my_program::init(registry);  // Add this
-}
+pub mod my_program;  // Add this
 ```
 
-Edit `bpfagent/src/main.rs` to add the module:
+Then register it in `bpfagent/src/app.rs` (`register_programs`):
 ```rust
-mod programs;  // Already exists
-mod my_program;  // Add this
+fn register_programs() -> ProgramRegistry {
+    let mut registry = ProgramRegistry::new();
+    crate::programs::kfree_skb::init(&mut registry);
+    crate::programs::sca::init(&mut registry);
+    crate::programs::my_program::init(&mut registry);  // Add this
+    registry
+}
 ```
 
 ### 5. Create build.rs

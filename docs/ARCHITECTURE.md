@@ -8,7 +8,7 @@ The bpfagent is a generic eBPF program manager that loads, manages, and collects
 
 ## Core Components
 
-### 1. Program Registry (`program.rs`)
+### 1. Program Registry (`programs/registry.rs`, `programs/traits.rs`)
 
 The program registry implements a plugin architecture for managing eBPF programs:
 
@@ -41,7 +41,7 @@ The `ProgramRegistry` manages available programs:
 └─────────────────────────────────┘
 ```
 
-### 2. Configuration (`config.rs`)
+### 2. Configuration (`config/loader.rs`)
 
 Configuration is loaded from TOML files with this structure:
 ```toml
@@ -64,7 +64,7 @@ enabled = true
 7. `~/.config/bpfagent/config.toml`
 8. `./bpfagent.conf` (current directory)
 
-### 3. Daemonization (`main.rs`)
+### 3. Daemonization (`daemon.rs`)
 
 The application supports daemon mode via `fork()` and proper file descriptor management:
 
@@ -151,7 +151,7 @@ Programs that support metrics implement `MetricsDisplay`:
 └──────────────────────────────────────┘
 ```
 
-### 6. HTTP Metrics Server (`metrics.rs`)
+### 6. HTTP Metrics Server (`metrics/server.rs`)
 
 Runs in a separate thread and serves metrics in Prometheus format:
 
@@ -240,20 +240,20 @@ pub fn init(registry: &mut ProgramRegistry) {
 }
 ```
 
-5. **Register in `main.rs`**:
+5. **Register in `bpfagent/src/app.rs`**:
 ```rust
 fn register_programs() -> ProgramRegistry {
     let mut registry = ProgramRegistry::new();
-    kfree_skb::init(&mut registry);
-    sca::init(&mut registry);
-    my_program::init(&mut registry);  // Add this
+    crate::programs::kfree_skb::init(&mut registry);
+    crate::programs::sca::init(&mut registry);
+    crate::programs::my_program::init(&mut registry);  // Add this
     registry
 }
 ```
 
-6. **Add module declaration in `main.rs`**:
+6. **Add module declaration in `bpfagent/src/programs/mod.rs`**:
 ```rust
-mod my_program;
+pub mod my_program;
 ```
 
 7. **Enable in config file**:

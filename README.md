@@ -300,11 +300,7 @@ scrape_configs:
 
 #### SCA
 
-The SCA program calculates latency based on socket path + direction matching:
-- Hop endpoints are tracked in `SOCKET_HOPS_MAP` keyed by `(pid << 32) | fd` (sender's connected fd and receiver's accepted fd, discovered via `ss -xp` peer-inode pairing)
-- On send TO listening socket: stores timestamp with key = `(hop_index << 32) | Protocol`
-- On send FROM listening socket: looks up the timestamp with the same key
-- Latency is calculated as current_timestamp - stored_timestamp on match
+The SCA program calculates latency per hop; see [SCA Data Flow](docs/SCA_DATA_FLOW.md#latency-measurement-approach) for the endpoint tracking and timestamp keying details.
 
 ```
 # HELP sca_avg_latency_per_pname Average latency in microseconds per process name
@@ -327,10 +323,7 @@ Drop counts (total: 1234):
 
 ### SCA Output
 
-The SCA program tracks latency per receiving process for each hop:
-- On send TO listening socket: stores timestamp with key = (hop_index << 32) | Protocol
-- On send FROM listening socket: looks up and calculates latency
-- Latency is calculated as current_timestamp - stored_timestamp on match
+The SCA program tracks latency per receiving process for each hop (keying details in [SCA Data Flow](docs/SCA_DATA_FLOW.md#latency-measurement-approach)):
 
 ```
 --- Moving Average Latency per PID ---
@@ -357,7 +350,10 @@ The drop reasons correspond to the kernel's `enum skb_drop_reason` (see `include
 bpfagent/
 ├── bpfagent/           # User-space Rust application
 │   ├── src/
-│   │   ├── main.rs     # Application entry point with argument parsing
+│   │   ├── main.rs     # Thin binary entry point
+│   │   ├── lib.rs      # Library root (all modules live here)
+│   │   ├── app.rs      # Program wiring and main event loop
+│   │   ├── daemon.rs   # Daemonization (fork, stdio redirect, setsid)
 │   │   ├── cli/        # Command-line argument definitions
 │   │   ├── config/     # Config file parsing and daemon settings
 │   │   ├── metrics/    # Prometheus metrics HTTP server
