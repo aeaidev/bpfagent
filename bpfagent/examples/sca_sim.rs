@@ -21,10 +21,15 @@
 //! Usage:
 //!   sca_sim            # launcher: spawns all roles, waits, cleans up on exit
 //!   sca_sim <ROLE>     # run a single role (used internally by the launcher)
+//!
+//! While the launcher runs, pressing SPACE in its terminal pauses sending
+//! (SIGSTOP on the initiator) and pressing it again resumes (SIGCONT). All
+//! simulator processes stay alive; only the data flow stops.
 
 use std::ffi::CString;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Wire protocol constants (must match what the eBPF program parses).
@@ -134,6 +139,10 @@ const ALL_PATHS: &[&str] = &[
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Original terminal settings, saved when the launcher switches stdin to
+/// keypress mode so they can be restored on exit.
+static ORIG_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
 extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
@@ -144,6 +153,81 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pause control (space bar toggles sending)
+// ---------------------------------------------------------------------------
+
+extern "C" fn restore_terminal() {
+    if let Ok(mut saved) = ORIG_TERMIOS.lock() {
+        if let Some(term) = saved.take() {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term);
+            }
+        }
+    }
+}
+
+/// Switch stdin to noncanonical, no-echo mode so a space keypress is
+/// delivered immediately, without Enter. Restored at exit via atexit.
+fn enable_keypress_mode() {
+    unsafe {
+        let mut term: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
+            log(
+                "launcher",
+                "stdin is not a TTY: use space + Enter to pause/resume",
+            );
+            return;
+        }
+        let mut raw = term;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
+            return;
+        }
+        if let Ok(mut saved) = ORIG_TERMIOS.lock() {
+            *saved = Some(term);
+        }
+        libc::atexit(restore_terminal);
+    }
+}
+
+/// Block on stdin; every space toggles SIGSTOP/SIGCONT on the initiator
+/// processes (DATA_SOURCE), pausing/resuming the flow of new requests while
+/// all simulator processes stay alive.
+fn watch_pause_key(initiator_pids: Vec<u32>) {
+    let mut paused = false;
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                byte.as_mut_ptr() as *mut libc::c_void,
+                1,
+            )
+        };
+        if n <= 0 {
+            return; // stdin closed
+        }
+        if byte[0] != b' ' {
+            continue;
+        }
+        paused = !paused;
+        let sig = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+        for &pid in &initiator_pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, sig);
+            }
+        }
+        eprintln!(
+            "sca_sim: {} - press space to {}",
+            if paused { "PAUSED" } else { "RESUMED" },
+            if paused { "resume" } else { "pause" }
+        );
     }
 }
 
@@ -496,6 +580,7 @@ fn run_launcher() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Now start the initiator.
+    let mut initiator_pids = Vec::new();
     for role in ROLES {
         if role.initiator_out.is_none() {
             continue;
@@ -505,6 +590,7 @@ fn run_launcher() {
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .unwrap_or_else(|e| fatal(&format!("failed to spawn {}: {}", role.name, e)));
+        initiator_pids.push(child.id());
         children.push(child);
     }
 
@@ -513,6 +599,12 @@ fn run_launcher() {
         "sca_sim: data flowing every {:?} — start bpfagent now",
         CYCLE_INTERVAL
     );
+
+    // Space bar pauses/resumes the initiator (SIGSTOP/SIGCONT) so stalled
+    // traffic can be tested without tearing down the pipeline.
+    enable_keypress_mode();
+    std::thread::spawn(move || watch_pause_key(initiator_pids));
+    eprintln!("sca_sim: press SPACE to pause/resume sending");
 
     // Wait until signaled or a child dies.
     while !SHUTDOWN.load(Ordering::SeqCst) {
@@ -533,6 +625,9 @@ fn run_launcher() {
 fn cleanup(mut children: Vec<Child>) {
     for child in children.iter_mut() {
         unsafe {
+            // SIGCONT first: a paused (SIGSTOP'd) child could not act on
+            // SIGTERM and child.wait() below would hang.
+            libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
             libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
         }
     }

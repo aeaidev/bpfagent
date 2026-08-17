@@ -25,6 +25,10 @@
 //! - Maintains sum and count of latencies within a 2-second window
 //! - Average = sum / count
 //! - Window resets when more than 2 seconds have elapsed
+//! - A PID is reported only while new samples keep arriving: once its
+//!   sum/count stop changing between display ticks (traffic paused or
+//!   processes gone) it is dropped from the output and its Prometheus
+//!   series is removed
 //!
 //! Prometheus Metrics
 //!
@@ -87,6 +91,10 @@ pub struct ScaProgram {
     socket_path_map: std::collections::HashMap<u32, String>,
     /// Mapping of PID to process name for display metrics
     socket_pid_map: std::collections::HashMap<u32, String>,
+    /// Freshness ledger: (sum, count) per PID as of the previous display
+    /// tick. A PID whose counters did not change has no new samples and is
+    /// not reported.
+    last_samples: std::collections::HashMap<u32, (u64, u64)>,
 }
 
 impl ScaProgram {
@@ -98,6 +106,7 @@ impl ScaProgram {
             metrics: None,
             socket_path_map: std::collections::HashMap::new(),
             socket_pid_map: std::collections::HashMap::new(),
+            last_samples: std::collections::HashMap::new(),
         }
     }
 
@@ -199,11 +208,36 @@ impl MetricsDisplay for ScaProgram {
             Err(_) => trace!("TRACEPOINT_COUNTER: 0 (no entries)"),
         }
 
-        info!("--- Moving Average Latency per PID ---");
-
+        // Snapshot the current (sum, count) per PID.
+        let mut samples = std::collections::HashMap::new();
         for pid in collect_pids(&sum_map, &count_map)? {
             let sum = sum_map.get(&pid, 0).unwrap_or(0);
             let count = count_map.get(&pid, 0).unwrap_or(0);
+            samples.insert(pid, (sum, count));
+        }
+
+        // The eBPF window only advances when new samples arrive, so a PID
+        // whose counters stopped changing (traffic paused or processes gone)
+        // would otherwise be reported forever with its last average.
+        let (fresh, stale) = partition_fresh(&mut self.last_samples, &samples);
+
+        // Drop the Prometheus series of stale PIDs so the exported metrics
+        // go quiet together with the log output.
+        for pid in stale {
+            let label = latency_label(&self.socket_pid_map, pid);
+            if let Err(e) = metrics.avg_latency_per_pname.remove_label_values(&[&label]) {
+                debug!("failed to remove stale latency series {}: {}", label, e);
+            }
+        }
+
+        if fresh.is_empty() {
+            debug!("No fresh latency samples, nothing to display");
+            return Ok(());
+        }
+
+        info!("--- Moving Average Latency per PID ---");
+        for pid in fresh {
+            let (sum, count) = samples[&pid];
             report_pid_latency(
                 metrics,
                 &self.socket_pid_map,
@@ -327,6 +361,35 @@ fn collect_pids(
     Ok(pids)
 }
 
+/// Split latency samples into PIDs with new samples since the previous tick
+/// (fresh) and PIDs whose (sum, count) did not change (stale), updating the
+/// ledger. Ledger entries for PIDs no longer present in the maps are dropped.
+pub fn partition_fresh(
+    ledger: &mut std::collections::HashMap<u32, (u64, u64)>,
+    samples: &std::collections::HashMap<u32, (u64, u64)>,
+) -> (Vec<u32>, Vec<u32>) {
+    ledger.retain(|pid, _| samples.contains_key(pid));
+    let mut fresh = Vec::new();
+    let mut stale = Vec::new();
+    for (&pid, &current) in samples {
+        if ledger.insert(pid, current) == Some(current) {
+            stale.push(pid);
+        } else {
+            fresh.push(pid);
+        }
+    }
+    (fresh, stale)
+}
+
+/// Prometheus series label for a PID: "<process name> (PID <pid>)".
+fn latency_label(socket_pid_map: &std::collections::HashMap<u32, String>, pid: u32) -> String {
+    let process_name = socket_pid_map
+        .get(&pid)
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    format!("{} (PID {})", process_name, pid)
+}
+
 /// Compute the moving average latency for a PID, print it, and update the gauge.
 fn report_pid_latency(
     metrics: &ScaMetrics,
@@ -357,7 +420,7 @@ fn report_pid_latency(
         }
     );
 
-    let label = format!("{} (PID {})", process_name, pid);
+    let label = latency_label(socket_pid_map, pid);
     metrics
         .avg_latency_per_pname
         .with_label_values(&[&label])

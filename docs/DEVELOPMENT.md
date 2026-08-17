@@ -88,6 +88,11 @@ REQ/REP over sendmsg; no root needed):
 cargo run -p bpfagent --example sca_sim
 ```
 
+While the simulator runs, press SPACE in its terminal to pause/resume the
+data flow (SIGSTOP/SIGCONT on the initiator; all processes stay alive). The
+agent's moving-average output should go quiet within one display interval
+while paused and come back on resume.
+
 Then, in another terminal, start the agent — hop discovery happens once at
 load, so the simulator must be running first:
 

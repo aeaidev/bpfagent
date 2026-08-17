@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved error messages with context
 - `.gitignore` with comprehensive ignore rules
 - SCA pipeline simulator example (`bpfagent/examples/sca_sim.rs`) for end-to-end testing
+- `sca_sim` space-bar pause: pressing SPACE in the simulator's terminal
+  SIGSTOP/SIGCONTs the initiator, pausing/resuming the data flow without
+  tearing down the pipeline
 
 ### Changed
 - Improved code organization with logical modules
@@ -37,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every display interval; they now increment only by the delta since last read
 - SCA moving-average window was 20 s instead of the documented 2 s
 - SCA process discovery no longer aborts on the first unreadable /proc entry
+- SCA moving-average output no longer repeats a PID's last average forever
+  after traffic stops; PIDs with no new samples between display ticks are
+  dropped from the log output and their Prometheus series are removed
 
 ## [0.1.0] - 2026-08-07
 
