@@ -91,10 +91,9 @@ pub struct ScaProgram {
     socket_path_map: std::collections::HashMap<u32, String>,
     /// Mapping of PID to process name for display metrics
     socket_pid_map: std::collections::HashMap<u32, String>,
-    /// Freshness ledger: (sum, count) per PID as of the previous display
-    /// tick. A PID whose counters did not change has no new samples and is
-    /// not reported.
-    last_samples: std::collections::HashMap<u32, (u64, u64)>,
+    /// Freshness ledger: state and last seen (sum, count) per PID. A PID
+    /// whose counters did not change has no new samples and is not reported.
+    last_samples: std::collections::HashMap<u32, SampleState>,
 }
 
 impl ScaProgram {
@@ -219,11 +218,11 @@ impl MetricsDisplay for ScaProgram {
         // The eBPF window only advances when new samples arrive, so a PID
         // whose counters stopped changing (traffic paused or processes gone)
         // would otherwise be reported forever with its last average.
-        let (fresh, stale) = partition_fresh(&mut self.last_samples, &samples);
+        let (fresh, newly_stale) = partition_fresh(&mut self.last_samples, &samples);
 
-        // Drop the Prometheus series of stale PIDs so the exported metrics
-        // go quiet together with the log output.
-        for pid in stale {
+        // Drop the Prometheus series of PIDs that just went quiet so the
+        // exported metrics go quiet together with the log output.
+        for pid in newly_stale {
             let label = latency_label(&self.socket_pid_map, pid);
             if let Err(e) = metrics.avg_latency_per_pname.remove_label_values(&[&label]) {
                 debug!("failed to remove stale latency series {}: {}", label, e);
@@ -361,24 +360,46 @@ fn collect_pids(
     Ok(pids)
 }
 
+/// Freshness state of a PID's latency samples, tracked across display ticks.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SampleState {
+    /// Reported on the previous tick; holds the last seen (sum, count).
+    Fresh(u64, u64),
+    /// Already dropped from the output and metrics; holds the last seen
+    /// (sum, count).
+    Cleared(u64, u64),
+}
+
 /// Split latency samples into PIDs with new samples since the previous tick
-/// (fresh) and PIDs whose (sum, count) did not change (stale), updating the
-/// ledger. Ledger entries for PIDs no longer present in the maps are dropped.
+/// (fresh) and PIDs that just went quiet (newly stale: their counters did
+/// not change since a tick where they were still fresh), updating the
+/// ledger. PIDs that stay quiet across further ticks remain in the ledger as
+/// cleared and are reported in neither list, so their Prometheus series is
+/// removed exactly once. Ledger entries for PIDs no longer present in the
+/// maps are dropped.
 pub fn partition_fresh(
-    ledger: &mut std::collections::HashMap<u32, (u64, u64)>,
+    ledger: &mut std::collections::HashMap<u32, SampleState>,
     samples: &std::collections::HashMap<u32, (u64, u64)>,
 ) -> (Vec<u32>, Vec<u32>) {
     ledger.retain(|pid, _| samples.contains_key(pid));
     let mut fresh = Vec::new();
-    let mut stale = Vec::new();
+    let mut newly_stale = Vec::new();
     for (&pid, &current) in samples {
-        if ledger.insert(pid, current) == Some(current) {
-            stale.push(pid);
-        } else {
-            fresh.push(pid);
+        match ledger.get(&pid).copied() {
+            Some(SampleState::Fresh(sum, count)) if (sum, count) == current => {
+                ledger.insert(pid, SampleState::Cleared(current.0, current.1));
+                newly_stale.push(pid);
+            }
+            Some(SampleState::Cleared(sum, count)) if (sum, count) == current => {
+                // Still quiet and already dropped: nothing to do.
+            }
+            _ => {
+                ledger.insert(pid, SampleState::Fresh(current.0, current.1));
+                fresh.push(pid);
+            }
         }
     }
-    (fresh, stale)
+    (fresh, newly_stale)
 }
 
 /// Prometheus series label for a PID: "<process name> (PID <pid>)".
