@@ -82,11 +82,11 @@ New features:
 ### Planned Features
 - [ ] Health check endpoint
 - [ ] Async HTTP server (hyper/axum)
-- [ ] GitHub Actions CI/CD pipeline
-- [ ] Pre-built release binaries
-- [ ] Docker image
+- [x] GitHub Actions CI/CD pipeline
+- [x] Pre-built release binaries
+- [x] Docker image
 - [ ] Kubernetes deployment manifests
-- [ ] Integration tests
+- [x] Integration tests
 - [ ] Security audit
 - [ ] Performance benchmarks
 - [ ] Extended eBPF programs library

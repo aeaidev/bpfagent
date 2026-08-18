@@ -11,8 +11,8 @@ A plugin consists of three parts:
 
 ## Quick Start
 
-A complete, copy-ready program template is also available at
-[`docs/templates/custom_program.rs`](templates/custom_program.rs).
+A copy-ready template for the userspace program module (step 3) is also
+available at [`docs/templates/custom_program.rs`](templates/custom_program.rs).
 
 ### 1. Create eBPF Program Directory
 
@@ -26,15 +26,19 @@ Create `Cargo.toml`:
 [package]
 name = "my_program-ebpf"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/aya-rs/aya" }
-aya-log-ebpf = { git = "https://github.com/aya-rs/aya" }
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
 
-[lib]
+[[bin]]
+name = "my_program"
 path = "src/main.rs"
 ```
+
+The `[[bin]]` name determines the file name under `OUT_DIR`, which is what
+`include_bytes_aligned!` loads in the userspace handler below.
 
 Create `src/main.rs`:
 ```rust
@@ -105,12 +109,21 @@ impl MyProgram {
     }
 }
 
-// Implement EbpfProgram trait
-use crate::program::EbpfProgram;
+// Implement the EbpfProgram trait and its mandatory EbpfAccess supertrait
+use crate::programs::{EbpfAccess, EbpfProgram};
+
+// EbpfAccess is a mandatory supertrait of EbpfProgram; it gives the agent
+// low-level access to the loaded Ebpf instance (e.g. for eBPF log capture)
+impl EbpfAccess for MyProgram {
+    fn ebpf_mut(&mut self) -> Option<&mut Ebpf> {
+        self.ebpf.as_mut()
+    }
+}
 
 impl EbpfProgram for MyProgram {
+    // aya names loaded programs after the eBPF function: my_handler
     fn bpf_program_name(&self) -> &str {
-        "my_program_handler"
+        "my_handler"
     }
 
     fn load(&mut self) -> Result<(), anyhow::Error> {
@@ -118,15 +131,15 @@ impl EbpfProgram for MyProgram {
             env!("OUT_DIR"),
             "/my_program"
         )))?;
-        
-        let program = ebpf
-            .program_mut("my_program_handler")
+
+        let program: &mut aya::programs::TracePoint = ebpf
+            .program_mut("my_handler")
             .ok_or_else(|| anyhow::anyhow!("program not found"))?
             .try_into()?;
-        
+
         program.load()?;
         program.attach("category", "event")?;
-        
+
         self.ebpf = Some(ebpf);
         Ok(())
     }
@@ -160,13 +173,27 @@ fn register_programs() -> ProgramRegistry {
 }
 ```
 
-### 5. Create build.rs
+### 5. Register the eBPF Crate for Building
 
-Create `bpfagent/build.rs` entry:
-```rust
-// This is already set up in the workspace
-// No changes needed if using aya-build
+Two edits are required so the eBPF program gets compiled and packaged:
+
+1. Add the crate to workspace `members` in the root `Cargo.toml`:
+```toml
+members = [
+    # ...
+    "ebpf/my_program",
+]
 ```
+
+2. Add the package name to the match in `bpfagent/build.rs`, which discovers
+eBPF packages from workspace metadata and builds them with aya-build:
+```rust
+"kfree_skb-ebpf" | "sca-ebpf" | "my_program-ebpf" => {
+```
+
+The compiled binary lands in `OUT_DIR` under its `[[bin]]` name
+(`my_program`), which is what the userspace handler loads via
+`include_bytes_aligned!(concat!(env!("OUT_DIR"), "/my_program"))`.
 
 ### 6. Add to Configuration
 
@@ -249,6 +276,33 @@ impl MetricsDisplay for CounterProgram {
 }
 ```
 
+### Enabling Metrics: `supports_metrics()` and `as_metrics_mut()`
+
+Implementing `MetricsDisplay` alone is not enough for metrics to appear.
+The agent gates all metrics wiring on two `EbpfProgram` methods
+(`bpfagent/src/app.rs` calls them in `setup_prometheus_metrics` and in the
+event loop), and their default implementations — `false` and `None` —
+disable metrics entirely. Programs that export metrics must override both
+(see `bpfagent/src/programs/sca/mod.rs` for a real example):
+
+```rust
+impl EbpfProgram for CounterProgram {
+    // ... bpf_program_name, load, start, as_any_mut ...
+
+    fn supports_metrics(&self) -> bool {
+        true
+    }
+
+    fn as_metrics_mut(&mut self) -> Option<&mut dyn MetricsDisplay> {
+        Some(self)
+    }
+}
+```
+
+Without these overrides the program loads and runs, but its metrics are
+never registered or displayed. See [Metrics not
+appearing](#metrics-not-appearing) if your metrics are missing.
+
 ## Testing Your Plugin
 
 ### Unit Tests
@@ -262,7 +316,7 @@ mod tests {
     #[test]
     fn test_initialization() {
         let program = MyProgram::new();
-        assert_eq!(program.bpf_program_name(), "my_program_handler");
+        assert_eq!(program.bpf_program_name(), "my_handler");
     }
 }
 ```
@@ -308,15 +362,19 @@ fn test_my_program_loads() {
 
 ### Program fails to load
 ```bash
-RUST_LOG=debug cargo run --release -- --daemon=false --verbose
+RUST_LOG=debug cargo run --release -- --verbose
 ```
 
 ### Metrics not appearing
 Check:
 1. Program is enabled in config
-2. Metrics registry is set up
-3. BPF maps are being populated
-4. No errors in logs
+2. Program overrides `supports_metrics()` (returns `true`) and
+   `as_metrics_mut()` (returns `Some(self)`) — see
+   [Enabling Metrics](#enabling-metrics-supports_metrics-and-as_metrics_mut);
+   the defaults (`false`/`None`) silently disable all metrics wiring
+3. Metrics registry is set up
+4. BPF maps are being populated
+5. No errors in logs
 
 ### eBPF Compilation Errors
 Ensure:

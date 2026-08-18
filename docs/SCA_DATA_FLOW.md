@@ -50,10 +50,15 @@ flowchart TD
 
 - All socket paths use Unix domain sockets
 - Data flows through multiple processes via intermediate sockets
-- SCA (System Communication Analyzer) traces traffic on these sockets
+- SCA (Socket Communication Analyzer) traces traffic on these sockets
 
 
 ## Taking the latancy based on NNG packet REQ/REP timestamp difference
+
+> **Note:** This section describes the original, superseded timestamp-keying
+> design and is kept for historical context. See
+> [Update (Current Architecture)](#update-current-architecture) below for the
+> current implementation.
 
 The data are sent in the following packet NNG/SCA format:
 
@@ -88,15 +93,19 @@ The following socket hops are configured for latency measurement:
 | `/tmp/DATA_L3_TO_WF_L`            | RED_WF_COMM_L                | INTERNAL_ROUTER          | INTERNAL_ROUTER → RED_WF_COMM_L |
 | `/tmp/WF_L_TO_FRAG`               | FRAGMENTER                   | RED_WF_COMM_L            | RED_WF_COMM_L → FRAGMENTER |
 | `/tmp/FRAG_TO_IRSS_L`             | RED_IRSS_COMM_L              | FRAGMENTER               | FRAGMENTER → RED_IRSS_COMM_L |
+| `/tmp/IRSS_L_TO_FRAG`             | FRAGMENTER                   | RED_IRSS_COMM_L          | RED_IRSS_COMM_L → FRAGMENTER |
+| `/tmp/FRAG_TO_COMM_WF_L`          | RED_WF_COMM_L                | FRAGMENTER               | FRAGMENTER → RED_WF_COMM_L |
+| `/tmp/DATA_L_TO_SINK`             | DATA_SINK                    | RED_WF_COMM_L            | RED_WF_COMM_L → DATA_SINK |
 
 #### Implementation Details
 
 1. **Socket Hops Map** (`SOCKET_HOPS_MAP`):
    - Key: `(pid << 32) | fd` (u64) — unambiguous because fd numbers are per-process
-   - Value: `HopEndpoint { hop_index, is_sender }`
+   - Value: `HopEndpoint { hop_index, is_sender, path }` — `path` is the hop's
+     Unix socket path (NUL-padded `[u8; 32]`, for logging)
    - Populated at program load time: each hop contributes up to two entries —
      the sender's connected fd and the receiver's accepted fd.
-   - Discovery uses `ss -xp` peer-inode pairing: the receiver's accepted socket
+   - Discovery uses `ss -xpH` peer-inode pairing: the receiver's accepted socket
      carries the hop path directly; the sender's connected socket (which has no
      path of its own) is resolved to a hop via its peer inode.
 
@@ -116,6 +125,8 @@ The following socket hops are configured for latency measurement:
 | Map Name              | Key Type      | Value Type    | Purpose |
 |-----------------------|---------------|---------------|--------|
 | `SOCKET_HOPS_MAP`     | `u64` ((pid << 32) \| fd) | `HopEndpoint` | Maps hop endpoints to (hop index, sender/receiver role) |
+| `TRACEPOINT_COUNTER`  | `u32` (always 0)  | `u64` | Diagnostic count of tracepoint invocations |
 | `TIMESTAMP_MAP`       | `u64` ((hop_index << 32) \| Protocol) | `u64` (timestamp) | Stores timestamps per hop keyed by NNG Protocol field |
 | `LATENCY_PID_SUM`     | `u32` (PID)   | `u64` | Sum of latencies per receiving process |
 | `LATENCY_PID_COUNT`   | `u32` (PID)   | `u64` | Count of samples per receiving process |
+| `LATENCY_WINDOW_START` | `u32` (PID)  | `u64` (timestamp) | Start timestamp of the current 2-second sliding window per receiving process |

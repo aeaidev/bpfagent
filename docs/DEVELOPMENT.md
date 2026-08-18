@@ -110,7 +110,7 @@ watch -n1 'curl -s http://localhost:9101/metrics | grep sca'
 
 ### Enable Debug Logging
 ```bash
-RUST_LOG=debug cargo run --release -- --daemon=false
+RUST_LOG=debug cargo run --release
 ```
 
 ### Debug with GDB
@@ -120,10 +120,10 @@ rust-gdb ./target/debug/bpfagent
 
 ### Check eBPF Program Loads
 ```bash
-cargo run --release -- --daemon=false --verbose
+cargo run --release -- --verbose
 ```
 
-Look for "Loaded program" messages to verify eBPF programs loaded successfully.
+Look for "Loading program: <name>" and "Loaded N programs" messages to verify eBPF programs loaded successfully.
 
 ## Code Quality
 
@@ -160,6 +160,7 @@ perf report
 
 ### Metrics Not Appearing
 - Verify HTTP endpoint: `curl http://localhost:9101/metrics`
+- Check listen address: `-i/--metrics-ip` and `-p/--metrics-port` (default `0.0.0.0:9101`)
 - Check program status: enable verbose mode
 - Review logs: `RUST_LOG=debug`
 
@@ -172,7 +173,7 @@ perf report
 1. Create eBPF source in `ebpf/<name>/src/main.rs`
 2. Create common types in `common/<name>/src/lib.rs`
 3. Create handler in `bpfagent/src/programs/<name>/`
-4. Register in `bpfagent/src/programs/mod.rs`
+4. Register in `register_programs()` in `bpfagent/src/app.rs`
 5. Add tests
 6. Document in `docs/PLUGINS.md`
 
@@ -196,7 +197,7 @@ cargo run --release -- --help
 
 ### Measure startup time
 ```bash
-time ./target/release/bpfagent --daemon=false --help
+time ./target/release/bpfagent --help
 ```
 
 ### Profile memory
@@ -206,7 +207,7 @@ time ./target/release/bpfagent --daemon=false --help
 
 ## Release Process
 
-1. Update version in `Cargo.toml`
+1. Update version in `bpfagent/Cargo.toml`
 2. Update `CHANGELOG.md`
 3. Run `./scripts/test.sh`
 4. Tag release: `git tag v1.2.3`

@@ -57,9 +57,10 @@ Be respectful, inclusive, and professional in all interactions.
 1. Create the eBPF program in `ebpf/<name>/`
 2. Create shared types in `common/<name>/`
 3. Create user-space handler in `bpfagent/src/programs/<name>/`
-4. Register the program in `bpfagent/src/programs/mod.rs`
-5. Add configuration to `config/bpfagent.conf.example`
-6. Document in `docs/PLUGINS.md`
+4. Add the module declaration in `bpfagent/src/programs/mod.rs`
+5. Register the program via its `init()` in `register_programs()` in `bpfagent/src/app.rs`
+6. Add configuration to `config/bpfagent.conf.example`
+7. Document in `docs/PLUGINS.md`
 
 See `docs/PLUGINS.md` for detailed instructions.
 

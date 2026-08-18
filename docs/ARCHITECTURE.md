@@ -64,6 +64,12 @@ enabled = true
 7. `~/.config/bpfagent/config.toml`
 8. `./bpfagent.conf` (current directory)
 
+**Other CLI flags**:
+- `-d/--daemon`: Run in daemon mode (background, no stdout output); interactive mode is the default
+- `-i/--metrics-ip`: Metrics server IP address (default `0.0.0.0`)
+- `-p/--metrics-port`: Metrics server port (default `9101`)
+- `-v/--verbose`: Enable verbose output (overrides daemon mode for interactive debugging)
+
 ### 3. Daemonization (`daemon.rs`)
 
 The application supports daemon mode via `fork()` and proper file descriptor management:
@@ -290,16 +296,16 @@ std::fs::read_to_string(path).expect("failed to read config")
 
 - `env_logger` for logging
 - Configurable via `RUST_LOG` environment variable
-- Log level defaults to `info` in daemon mode
+- Log level defaults to `info` in interactive (foreground) mode and `debug` in daemon mode
 - Logs directed to:
   - Stdout/stderr in interactive mode
   - Log file in daemon mode (configured in config file)
 
 ## Performance Considerations
 
-1. **eBPF Maps**: Per-CPU hashmaps for lock-free updates
+1. **eBPF Maps**: Plain shared `aya_ebpf::maps::HashMap`s (no per-CPU maps)
 2. **Metrics Display**: Periodic polling (3 seconds) balances responsiveness and overhead
-3. **HTTP Server**: Single-threaded but asynchronous within Tokio
+3. **HTTP Server**: Blocking, synchronous `TcpListener` I/O on a dedicated `std::thread`; only shutdown waits on an async `CancellationToken`
 4. **Memory**: BPF map sizes configured at compile time in eBPF programs
 
 ## Security

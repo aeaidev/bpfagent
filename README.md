@@ -12,7 +12,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - 🛠️ **[Plugin Development](docs/PLUGINS.md)** - Create new eBPF programs
 - 📝 **[Contributing](docs/CONTRIBUTING.md)** - How to contribute
 - ⚙️ **[Configuration](config/bpfagent.conf.full)** - Full config options
-- 🐳 **[Examples](examples/)** - Deployment examples (Docker, systemd)
+- 🐳 **[Examples](examples/)** - Deployment examples (Docker; systemd unit in [config/systemd/](config/systemd/))
 - 📋 **[Changelog](CHANGELOG.md)** - Version history
 
 ## Overview
@@ -29,6 +29,9 @@ The SCA program traces socket communication latency by measuring the timestamp d
 - **INTERNAL_ROUTER → RED_WF_COMM_L**: Measures latency for `/tmp/DATA_L3_TO_WF_L`
 - **RED_WF_COMM_L → FRAGMENTER**: Measures latency for `/tmp/WF_L_TO_FRAG`
 - **FRAGMENTER → RED_IRSS_COMM_L**: Measures latency for `/tmp/FRAG_TO_IRSS_L`
+- **RED_IRSS_COMM_L → FRAGMENTER**: Measures latency for `/tmp/IRSS_L_TO_FRAG`
+- **FRAGMENTER → RED_WF_COMM_L**: Measures latency for `/tmp/FRAG_TO_COMM_WF_L`
+- **RED_WF_COMM_L → DATA_SINK**: Measures latency for `/tmp/DATA_L_TO_SINK`
 
 For each hop, it:
 1. Stores timestamp when the sending process sends TO the listening socket
@@ -54,11 +57,11 @@ Latencies are tracked using a sliding window moving average (2-second window) an
 # Build
 ./scripts/build.sh release
 
-# Run in interactive mode
-sudo ./target/release/bpfagent --daemon=false
+# Run in interactive mode (default)
+sudo ./target/x86_64-unknown-linux-gnu/release/bpfagent
 
 # Run as daemon
-sudo ./target/release/bpfagent -d -f config/bpfagent.conf.example
+sudo ./target/x86_64-unknown-linux-gnu/release/bpfagent -d -f config/bpfagent.conf.example
 ```
 
 ### Access Metrics
@@ -138,7 +141,7 @@ Use the `-f/--config-file` option to specify a custom config file path.
 3. **Linux kernel** with:
    - BPF support (CONFIG_BPF=y)
    - Tracepoint support for `skb:kfree_skb` (for kfree_skb program)
-   - Tracepoint support for `syscalls:sys_enter_sendmsg`, `syscalls:sys_enter_write`, etc. (for SCA program)
+   - Tracepoint support for `syscalls:sys_enter_sendmsg` (for SCA program)
    - BTF debug info (CONFIG_DEBUG_INFO_BTF=y) - for best compatibility
 
 ## Build & Run
@@ -149,17 +152,16 @@ Use the `-f/--config-file` option to specify a custom config file path.
 
 The application supports two running modes:
 
-**Daemon Mode (default)**
-- Runs in the background without stdout output
-- Only Prometheus metrics endpoint provides feedback
-- Use `-d` to enable or `--daemon=false` to disable
-
-**Interactive Mode**
+**Interactive Mode (default)**
 - Displays statistics to stdout every 3 seconds
   - For kfree_skb: drop counts by reason
-  - For SCA: max latency per process name
-- Use `--daemon=false` to enable interactive mode
-- Use `--verbose` to enable verbose logging in daemon mode
+  - For SCA: moving average latency per process name
+
+**Daemon Mode**
+- Runs in the background without stdout output
+- Only Prometheus metrics endpoint provides feedback
+- Use `-d` to enable daemon mode
+- Use `--verbose` to enable verbose logging (overrides daemon mode for interactive debugging)
 
 The metrics server listens on port **9101** by default (changeable with `-p`).
 
@@ -175,7 +177,7 @@ sudo cargo run --release -- -f /etc/bpfagent.conf
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `-d, --daemon` | | `true` | Run in daemon mode (no stdout output) |
+| `-d, --daemon` | | `false` | Run in daemon mode (no stdout output) |
 | `-i, --metrics-ip` | | `0.0.0.0` | Metrics server IP address |
 | `-p, --metrics-port` | | `9101` | Metrics server port |
 | `-v, --verbose` | | | Enable verbose output (overrides daemon mode for interactive debugging) |
@@ -184,16 +186,16 @@ sudo cargo run --release -- -f /etc/bpfagent.conf
 **Examples:**
 
 ```bash
-# Default: run in daemon mode with default config paths
+# Default: run in interactive mode with default config paths
 sudo cargo run --release
 
 # Run with custom config file
 sudo cargo run --release -- -f /path/to/bpfagent.conf
 
-# Run in interactive mode with stdout output
-sudo cargo run --release -- --daemon=false
+# Run in daemon mode
+sudo cargo run --release -- -d
 
-# Run in daemon mode but with verbose logging
+# Run interactively with verbose logging (verbose overrides daemon mode)
 sudo cargo run --release -- --verbose
 
 # Listen on localhost only
@@ -288,10 +290,10 @@ scrape_configs:
 #### kfree_skb
 
 ```
-# HELP kfree_skb_total_drops Total number of SKB drops
+# HELP kfree_skb_total_drops Total number of dropped packets
 # TYPE kfree_skb_total_drops counter
  kfree_skb_total_drops{reason="all"} 1234
-# HELP kfree_skb_drops_by_reason Number of drops by reason
+# HELP kfree_skb_drops_by_reason Number of dropped packets by reason
 # TYPE kfree_skb_drops_by_reason counter
  kfree_skb_drops_by_reason{reason_code="10",reason_name="TCP_CSUM"} 456
  kfree_skb_drops_by_reason{reason_code="64",reason_name="QDISC_DROP"} 321
@@ -380,7 +382,7 @@ bpfagent/
 
 #### SCA
 
-- `bpfagent/src/programs/sca/mod.rs` - SCA-specific logic (metrics, display, hop discovery via `ss -xp`)
+- `bpfagent/src/programs/sca/mod.rs` - SCA-specific logic (metrics, display, hop discovery via `ss -xpH`)
 - `ebpf/sca/src/main.rs` - eBPF program that matches NNG Protocol timestamps per hop for latency calculation
 - `common/sca/src/lib.rs` - Common types (hop endpoints, data flow, tracepoints)
 - `bpfagent/examples/sca_sim.rs` - SCA pipeline simulator for end-to-end testing

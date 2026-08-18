@@ -1,5 +1,11 @@
 # Code Quality Improvements - Summary
 
+> **Note:** This document is kept for history. It describes the code layout as
+> of the quality-improvements refactor it summarizes; the codebase has since
+> been restructured. The current layout is documented in ARCHITECTURE.md and in
+> the README's "Project Structure" section. File paths referenced below refer
+> to the pre-restructure layout.
+
 This document summarizes the quality improvements implemented for the bpfagent project.
 
 ## Issues Addressed
