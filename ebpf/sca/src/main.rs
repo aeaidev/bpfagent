@@ -58,6 +58,17 @@ pub static TRACEPOINT_COUNTER: HashMap<u32, u64> = HashMap::with_max_entries(1, 
 #[map]
 pub static TIMESTAMP_MAP: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 
+/// Completed raw (accumulated) latency per (hop, protocol) message:
+/// Key: (hop_index << 32) | Protocol
+/// A receiver's REP only goes out after the downstream hop has completed
+/// (lockstep REQ/REP chain), so when hop i completes, hop i+1's latency for
+/// the same message is already published here. Hop i subtracts it to get its
+/// individual latency contribution and publishes its own raw latency for
+/// hop i-1. Entries are consumed by the upstream hop; hop 0 has no upstream
+/// and is never stored, so the map cannot fill up with stale entries.
+#[map]
+pub static LATENCY_HOP_MAP: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+
 /// Sum of latencies per PID for moving average calculation
 #[map]
 pub static LATENCY_PID_SUM: HashMap<u32, u64> = HashMap::with_max_entries(16, 0);
@@ -105,7 +116,9 @@ tracepoint_handler!(sys_enter_sendmsg, sys_enter_sendmsg_handler);
 /// - When the hop's sending process sends TO the socket: store timestamp with
 ///   (hop_index << 32) | Protocol as key
 /// - When the hop's receiving process sends FROM the socket (response): look up
-///   the timestamp with the same key and calculate the latency
+///   the timestamp with the same key and calculate the raw latency, then
+///   subtract the downstream hop's latency so the reported value is this
+///   hop's individual contribution, not the accumulated remainder of the chain
 fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     // Syscall arguments (see /sys/kernel/tracing/events/syscalls/sys_enter_sendmsg/format):
     // fd at offset 16, msg (struct user_msghdr *) at offset 24, flags at offset 32
@@ -163,12 +176,18 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
             }
         } else {
             // This process is sending FROM the listening socket (REP):
-            // look up the timestamp and calculate latency
+            // look up the timestamp and calculate latency. The raw value
+            // accumulates all downstream hops (the REP goes out only after
+            // the downstream REP arrived), so subtract the downstream hop's
+            // latency to get this hop's individual contribution.
             let latency =
                 unsafe { lookup_timestamp_with_protocol(&ctx, endpoint.hop_index, protocol) };
             if latency > 0 {
+                let individual = unsafe {
+                    subtract_downstream_latency(endpoint.hop_index, protocol, latency)
+                };
                 let current_time = unsafe { bpf_ktime_get_ns() };
-                unsafe { update_moving_average(&ctx, current_pid, latency, current_time) }
+                unsafe { update_moving_average(&ctx, current_pid, individual, current_time) }
                 debug!(
                     &ctx,
                     "REP: {} (pid {}) send reply from {} (fd {}): matched protocol=0x{:x}, msg_type=0x{:x}, latency={} ns",
@@ -178,7 +197,7 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
                     fd,
                     protocol,
                     msg_type,
-                    latency
+                    individual
                 );
             }
         }
@@ -324,6 +343,34 @@ unsafe fn lookup_timestamp_with_protocol(
         );
         0
     }
+}
+
+/// Turn an accumulated hop latency into this hop's individual contribution.
+///
+/// Hops are indexed in data-flow order, so the downstream of hop `hop_index`
+/// is `hop_index + 1`, and the lockstep REQ/REP cascade guarantees the
+/// downstream hop's latency for the same message (same NNG protocol id) has
+/// already been published in LATENCY_HOP_MAP when this hop completes. The
+/// raw latency is published for the upstream hop first; hop 0 has no
+/// upstream, so it is not stored (its protocol-keyed entries would never be
+/// consumed). Falls back to the raw latency when there is no downstream hop
+/// (terminal hop) or no matching downstream sample (first message of a
+/// cycle, evicted entry).
+unsafe fn subtract_downstream_latency(hop_index: u32, protocol: u32, latency: u64) -> u64 {
+    let key = ((hop_index as u64) << 32) | (protocol as u64);
+    if hop_index > 0 {
+        let _ = LATENCY_HOP_MAP.insert(&key, &latency, 0);
+    }
+    let next = hop_index + 1;
+    if next < sca_common::DATA_FLOW.len() as u32 {
+        let next_key = ((next as u64) << 32) | (protocol as u64);
+        if let Some(downstream) = LATENCY_HOP_MAP.get(&next_key) {
+            let individual = latency.saturating_sub(*downstream);
+            let _ = LATENCY_HOP_MAP.remove(&next_key);
+            return individual;
+        }
+    }
+    latency
 }
 
 /// Update moving average for PID

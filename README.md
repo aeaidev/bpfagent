@@ -118,7 +118,9 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - Measures latency based on socket path + direction (TO/FROM) matching
   - On send TO listening socket: stores timestamp with key = (hop_index << 32) | Protocol
   - On send FROM listening socket: looks up timestamp with the same key
-  - Calculates latency as timestamp difference on match
+  - Raw latency is the timestamp difference on match; the downstream hop's
+    latency for the same message is then subtracted, so the reported value is
+    each hop's individual contribution rather than the accumulated chain
   - Tracks moving average latency per process name (2-second sliding window)
   - Exports metrics via Prometheus with process name labels
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
@@ -283,7 +285,7 @@ scrape_configs:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sca_avg_latency_per_pname` | Gauge | `pname` | Moving average latency in microseconds per process name (based on socket path + direction timestamp difference) |
+| `sca_avg_latency_per_pname` | Gauge | `pname` | Moving average of the individual hop latency in microseconds per process name (raw REQ/REP timestamp difference minus the downstream hop's latency) |
 
 ### Metrics Output Example
 
@@ -305,7 +307,7 @@ scrape_configs:
 The SCA program calculates latency per hop; see [SCA Data Flow](docs/SCA_DATA_FLOW.md#latency-measurement-approach) for the endpoint tracking and timestamp keying details.
 
 ```
-# HELP sca_avg_latency_per_pname Average latency in microseconds per process name
+# HELP sca_avg_latency_per_pname Average individual hop latency in microseconds per process name
 # TYPE sca_avg_latency_per_pname gauge
  sca_avg_latency_per_pname{pname="INTERNAL_ROUTER (PID 1234)"} 60769
  sca_avg_latency_per_pname{pname="FRAGMENTER (PID 1237)"} 34985
@@ -391,4 +393,6 @@ bpfagent/
 - Uses a combined key of hop index (4B) + Protocol (4B) to match REQ/REP message pairs
 - On send TO the listening socket (sender endpoint): stores timestamp with key = (hop_index << 32) | Protocol
 - On send FROM the listening socket (receiver endpoint): looks up timestamp with the same key
-- Latency = current_timestamp - stored_timestamp on match
+- Raw latency = current_timestamp - stored_timestamp on match; the downstream
+  hop's latency for the same message is then subtracted (LATENCY_HOP_MAP), so
+  the reported value is each hop's individual contribution

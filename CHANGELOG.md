@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed error handling in metrics initialization
 - kfree_skb Prometheus counters were inflated by re-adding cumulative map values
   every display interval; they now increment only by the delta since last read
+- SCA per-process latency was accumulative (each hop included all downstream
+  hops, since a reply is sent only after the downstream reply arrives); the
+  downstream hop's latency for the same message is now subtracted
+  (`LATENCY_HOP_MAP`), so `sca_avg_latency_per_pname` reports each hop's
+  individual contribution
 - SCA moving-average window was 20 s instead of the documented 2 s
 - SCA process discovery no longer aborts on the first unreadable /proc entry
 - SCA moving-average output no longer repeats a PID's last average forever

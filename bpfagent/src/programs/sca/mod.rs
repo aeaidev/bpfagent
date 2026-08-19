@@ -17,7 +17,11 @@
 //!   key = (hop_index << 32) | Protocol
 //! - Second send (receiver sends FROM the listening socket as response): looks
 //!   up the timestamp with the same key
-//! - Latency is calculated as the timestamp difference on match
+//! - Raw latency is the timestamp difference on match. Because a receiver's
+//!   response goes out only after the downstream hop completed, the raw value
+//!   accumulates the rest of the chain, so the downstream hop's latency for
+//!   the same message (LATENCY_HOP_MAP) is subtracted: the reported latency
+//!   is each hop's individual contribution.
 //!
 //! # Moving Average
 //!
@@ -64,7 +68,7 @@ impl ScaMetrics {
         let avg_latency_per_pname = IntGaugeVec::new(
             Opts::new(
                 "sca_avg_latency_per_pname",
-                "Average latency in microseconds per process name",
+                "Average individual hop latency in microseconds per process name",
             ),
             &["pname"],
         )

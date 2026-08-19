@@ -36,11 +36,46 @@ flowchart TD
     RED_IRSS_COMM_L -->|/tmp/IRSS_TO_CRYPTO_L| CRYPTO_L[Crypto Layer]
 ```
 
+### Transmit Path (TX) — Sequence Diagram
+
+Each hop is a lockstep REQ/REP exchange over a persistent Unix-socket
+connection: the sender pushes a request with `sendmsg()`, the receiver
+forwards it downstream, waits for the reply, then replies upstream on the
+same connection (same protocol id, msg type + 1).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant IP as IP Socket
+    participant DS as DATA_SOURCE
+    participant IR as INTERNAL_ROUTER
+    participant WF as RED_WF_COMM_L
+    participant FG as FRAGMENTER
+    participant IS as RED_IRSS_COMM_L
+    participant CR as Crypto Layer
+
+    Note over DS,CR: Wire format: 9B SPF | 4B protocol | 2B msg type | 2B size | payload
+
+    IP->>DS: IP packet received
+    DS->>IR: sendmsg REQ over /tmp/DATA_L3_TO_INTERNAL_ROUTER
+    IR->>WF: sendmsg REQ over /tmp/DATA_L3_TO_WF_L
+    WF->>FG: sendmsg REQ over /tmp/WF_L_TO_FRAG
+    FG->>IS: sendmsg REQ over /tmp/FRAG_TO_IRSS_L
+    IS->>CR: sendmsg REQ over /tmp/IRSS_TO_CRYPTO_L
+    CR-->>IS: REP
+    IS-->>FG: sendmsg REP over /tmp/FRAG_TO_IRSS_L
+    FG-->>WF: sendmsg REP over /tmp/WF_L_TO_FRAG
+    WF-->>IR: sendmsg REP over /tmp/DATA_L3_TO_WF_L
+    IR-->>DS: sendmsg REP over /tmp/DATA_L3_TO_INTERNAL_ROUTER
+
+    Note over DS,IS: SCA eBPF hooks sys_enter_sendmsg: stores a timestamp on<br/>send TO a listening socket (key = hop_index << 32 OR protocol),<br/>takes latency = Δt when the receiver sends FROM that socket
+```
+
 ### Receive Path (RX)
 
 ```mermaid
 flowchart TD
-    FRAG_TO_IRSS_L[/tmp/FRAG_TO_IRSS_L] --> RED_IRSS_COMM_L[RED_IRSS_COMM_L]
+    FRAG_TO_IRSS_L["/tmp/FRAG_TO_IRSS_L"] --> RED_IRSS_COMM_L[RED_IRSS_COMM_L]
     RED_IRSS_COMM_L -->|/tmp/IRSS_L_TO_FRAG| FRAGMENTER[FRAGMENTER]
     FRAGMENTER -->|/tmp/FRAG_TO_COMM_WF_L| RED_WF_COMM_L[RED_WF_COMM_L]
     RED_WF_COMM_L -->|/tmp/DATA_L_TO_SINK| DATA_SINK[DATA_SINK]
@@ -81,7 +116,25 @@ For each tracked socket hop, the program:
 2. Uses a combined key of **hop index + Protocol** for timestamp tracking
 3. When the sending process sends TO the socket: stores timestamp with `(hop_index << 32) | Protocol` as key
 4. When the receiving process sends FROM that socket: looks up the timestamp with the same key
-5. Calculates latency as: `current_timestamp - stored_timestamp`
+5. Calculates raw latency as: `current_timestamp - stored_timestamp`
+6. Subtracts the downstream hop's latency for the same message (see below)
+
+#### Individual vs. accumulated latency
+
+A receiver's reply only goes out after the message has travelled the rest of
+the chain and come back (lockstep REQ/REP), so the raw latency of hop *i*
+accumulates hop *i+1*: `raw(i) ≈ processing(i) + raw(i+1)`. To report each
+hop's **individual** contribution, the eBPF program publishes the raw latency
+in `LATENCY_HOP_MAP` (key `(hop_index << 32) | Protocol`) and, on completion
+of hop *i*, subtracts hop *i+1*'s raw latency for the same message:
+
+```
+individual(i) = raw(i) - raw(i+1)      (hop 6, the terminal hop, reports raw)
+```
+
+The lockstep ordering guarantees hop *i+1* completes before hop *i*, so the
+downstream sample is always present in steady state; if it is missing (first
+message of a cycle), the raw value is used as the fallback.
 
 #### Socket Hops Configuration
 
@@ -127,6 +180,7 @@ The following socket hops are configured for latency measurement:
 | `SOCKET_HOPS_MAP`     | `u64` ((pid << 32) \| fd) | `HopEndpoint` | Maps hop endpoints to (hop index, sender/receiver role) |
 | `TRACEPOINT_COUNTER`  | `u32` (always 0)  | `u64` | Diagnostic count of tracepoint invocations |
 | `TIMESTAMP_MAP`       | `u64` ((hop_index << 32) \| Protocol) | `u64` (timestamp) | Stores timestamps per hop keyed by NNG Protocol field |
+| `LATENCY_HOP_MAP`     | `u64` ((hop_index << 32) \| Protocol) | `u64` (latency ns) | Raw per-hop latency of completed messages, consumed by the upstream hop to compute the individual contribution |
 | `LATENCY_PID_SUM`     | `u32` (PID)   | `u64` | Sum of latencies per receiving process |
 | `LATENCY_PID_COUNT`   | `u32` (PID)   | `u64` | Count of samples per receiving process |
 | `LATENCY_WINDOW_START` | `u32` (PID)  | `u64` (timestamp) | Start timestamp of the current 2-second sliding window per receiving process |
