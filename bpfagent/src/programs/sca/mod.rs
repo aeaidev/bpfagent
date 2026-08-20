@@ -34,11 +34,19 @@
 //!   processes gone) it is dropped from the output and its Prometheus
 //!   series is removed
 //!
+//! # Process Restart
+//!
+//! When no fresh samples arrive while PIDs are still tracked, the traced
+//! processes have likely restarted, invalidating their PIDs and socket fds.
+//! Endpoint discovery then re-runs (rate-limited): entries keyed by dead
+//! PIDs are evicted from SOCKET_HOPS_MAP and the per-PID latency maps, and
+//! SOCKET_HOPS_MAP is repopulated from the new processes.
+//!
 //! Prometheus Metrics
 //!
 //! - `sca_avg_latency_per_pname`: Moving average latency in microseconds per process name
 
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc, time::{Duration, Instant}};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use log::{debug, error, info, warn};
@@ -53,6 +61,10 @@ use sca_common;
 /// The struct layout must match between userspace and eBPF
 /// Since both define it as #[repr(C)] with the same u32 fields, they are binary compatible
 pub use sca_common::HopEndpoint;
+
+/// Minimum interval between endpoint-rediscovery attempts while no fresh
+/// latency samples arrive (the likely sign of restarted processes).
+const REPOPULATION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Prometheus metrics for SCA program
 pub struct ScaMetrics {
@@ -98,6 +110,9 @@ pub struct ScaProgram {
     /// Freshness ledger: state and last seen (sum, count) per PID. A PID
     /// whose counters did not change has no new samples and is not reported.
     last_samples: std::collections::HashMap<u32, SampleState>,
+    /// Last time endpoint rediscovery ran while the data flow was quiet
+    /// (rate limiting); None if it never ran.
+    last_repopulation: Option<Instant>,
 }
 
 impl ScaProgram {
@@ -110,6 +125,7 @@ impl ScaProgram {
             socket_path_map: std::collections::HashMap::new(),
             socket_pid_map: std::collections::HashMap::new(),
             last_samples: std::collections::HashMap::new(),
+            last_repopulation: None,
         }
     }
 
@@ -227,6 +243,25 @@ impl MetricsDisplay for ScaProgram {
         }
 
         if fresh.is_empty() {
+            // No latency updates at all: the traced processes were likely
+            // restarted, invalidating their PIDs and socket fds. Rediscover
+            // endpoints (rate-limited) so tracing resumes without an agent
+            // restart. This also fires on a mere traffic pause or right at
+            // agent startup, but rediscovery is idempotent: it finds the
+            // same endpoints and changes nothing.
+            if self
+                .last_repopulation
+                .map_or(true, |t| t.elapsed() >= REPOPULATION_INTERVAL)
+            {
+                self.last_repopulation = Some(Instant::now());
+                if let Err(e) = repopulate_socket_hops_map(
+                    &mut self.socket_path_map,
+                    &mut self.socket_pid_map,
+                    ebpf,
+                ) {
+                    warn!("endpoint rediscovery failed: {}", e);
+                }
+            }
             debug!("No fresh latency samples, nothing to display");
             return Ok(());
         }
@@ -611,6 +646,72 @@ fn populate_socket_hops_map(
         }
     }
     Ok(())
+}
+
+/**
+ * Re-run endpoint discovery after the traced processes restarted.
+ *
+ * Entries keyed by dead PIDs are evicted first: SOCKET_HOPS_MAP has room
+ * for exactly one sender and one receiver fd per hop, and the per-PID
+ * latency maps (16 entries each) would otherwise fill up with dead PIDs
+ * across restarts, silently dropping new samples. The display maps are
+ * then rebuilt from scratch by populate_socket_hops_map.
+ */
+fn repopulate_socket_hops_map(
+    socket_path_map: &mut std::collections::HashMap<u32, String>,
+    socket_pid_map: &mut std::collections::HashMap<u32, String>,
+    ebpf: &mut Ebpf,
+) -> anyhow::Result<()> {
+    let live_pids: HashSet<u32> = collect_data_flow_pids().into_values().collect();
+
+    {
+        let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
+            return Err(anyhow::anyhow!("SOCKET_HOPS_MAP not found"));
+        };
+        let mut hops_map: HashMap<_, u64, HopEndpoint> = map
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
+        let mut stale_keys = Vec::new();
+        for result in hops_map.iter() {
+            let (key, _) =
+                result.map_err(|e| anyhow::anyhow!("failed to iterate SOCKET_HOPS_MAP: {}", e))?;
+            if !live_pids.contains(&((key >> 32) as u32)) {
+                stale_keys.push(key);
+            }
+        }
+        for key in stale_keys {
+            hops_map.remove(&key).ok();
+        }
+    }
+
+    for name in [
+        "LATENCY_PID_SUM",
+        "LATENCY_PID_COUNT",
+        "LATENCY_WINDOW_START",
+    ] {
+        let mut pid_map: HashMap<_, u32, u64> = ebpf
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("{} map not found", name))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("failed to open {} map", name))?;
+        let mut stale_pids = Vec::new();
+        for result in pid_map.iter() {
+            let (pid, _) =
+                result.map_err(|e| anyhow::anyhow!("failed to iterate {} map: {}", name, e))?;
+            if !live_pids.contains(&pid) {
+                stale_pids.push(pid);
+            }
+        }
+        for pid in stale_pids {
+            pid_map.remove(&pid).ok();
+        }
+    }
+
+    socket_pid_map.clear();
+    socket_path_map.clear();
+
+    info!("Latency updates stopped, re-running SCA endpoint discovery");
+    populate_socket_hops_map(socket_path_map, socket_pid_map, ebpf)
 }
 
 /// Get PID from process name by reading /proc/*/comm
