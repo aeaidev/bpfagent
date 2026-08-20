@@ -178,7 +178,6 @@ The following socket hops are configured for latency measurement:
 | Map Name              | Key Type      | Value Type    | Purpose |
 |-----------------------|---------------|---------------|--------|
 | `SOCKET_HOPS_MAP`     | `u64` ((pid << 32) \| fd) | `HopEndpoint` | Maps hop endpoints to (hop index, sender/receiver role) |
-| `TRACEPOINT_COUNTER`  | `u32` (always 0)  | `u64` | Diagnostic count of tracepoint invocations |
 | `TIMESTAMP_MAP`       | `u64` ((hop_index << 32) \| Protocol) | `u64` (timestamp) | Stores timestamps per hop keyed by NNG Protocol field |
 | `LATENCY_HOP_MAP`     | `u64` ((hop_index << 32) \| Protocol) | `u64` (latency ns) | Raw per-hop latency of completed messages, consumed by the upstream hop to compute the individual contribution |
 | `LATENCY_PID_SUM`     | `u32` (PID)   | `u64` | Sum of latencies per receiving process |

@@ -41,7 +41,7 @@
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use prometheus::{IntGaugeVec, Opts, Registry};
 
 use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
@@ -203,13 +203,6 @@ impl MetricsDisplay for ScaProgram {
         // Read sum and count from separate maps (PID-based)
         let sum_map = open_pid_map(ebpf, "LATENCY_PID_SUM")?;
         let count_map = open_pid_map(ebpf, "LATENCY_PID_COUNT")?;
-
-        // Check if tracepoint is being called
-        let tracepoint_counter_map = open_pid_map(ebpf, "TRACEPOINT_COUNTER")?;
-        match tracepoint_counter_map.get(&0, 0) {
-            Ok(count) => trace!("TRACEPOINT_COUNTER: {}", count),
-            Err(_) => trace!("TRACEPOINT_COUNTER: 0 (no entries)"),
-        }
 
         // Snapshot the current (sum, count) per PID.
         let mut samples = std::collections::HashMap::new();
