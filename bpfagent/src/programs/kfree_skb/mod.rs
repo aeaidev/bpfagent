@@ -8,31 +8,44 @@
 //!
 //! # Prometheus Metrics
 //!
-//! - `kfree_skb_total_drops`: Total number of SKB drops
-//! - `kfree_skb_drops_by_reason`: Count of drops by reason code and name
+//! - `kfree_skb_total_drops_per_sec`: Total drop rate (all reasons)
+//! - `kfree_skb_drops_per_sec`: Drop rate by reason code and name
+//!
+//! Both are moving averages over a 10-second sliding window: the BPF map
+//! holds cumulative counts since program load, userspace converts them to
+//! per-tick deltas and averages the deltas in the window. A reason with no
+//! drops in the window decays to zero and its series is removed.
 //!
 //! # Example Output
 //!
 //! ```text
-//! Drop counts (total: 1234):
-//!   10 (TCP_CSUM               ): 456
-//!   64 (QDISC_DROP             ): 321
-//!    3 (NO_SOCKET              ): 234
+//! Drop rates (drops/sec, 10s moving average; total: 3.7):
+//!   10 (TCP_CSUM               ): 2.1
+//!   64 (QDISC_DROP             ): 1.2
+//!    3 (NO_SOCKET              ): 0.4
 //! ```
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
-use prometheus::{IntCounterVec, Opts, Registry};
+use prometheus::{GaugeVec, Opts, Registry};
 
 use crate::programs::{EbpfAccess, EbpfProgram, MetricsDisplay, ProgramRegistry};
 
+/// Sliding window for the moving-average drop rate.
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+
 /// Prometheus metrics for KfreeSkb program
 pub struct KfreeSkbMetrics {
-    pub total_drops: IntCounterVec,
-    pub drops_by_reason: IntCounterVec,
+    pub total_drops_per_sec: GaugeVec,
+    pub drops_per_sec: GaugeVec,
 }
 
 impl KfreeSkbMetrics {
@@ -41,32 +54,37 @@ impl KfreeSkbMetrics {
     /// # Errors
     /// Returns error if metric creation or registration fails
     pub fn new(registry: Arc<Registry>) -> anyhow::Result<Self> {
-        let total_drops = IntCounterVec::new(
-            Opts::new("kfree_skb_total_drops", "Total number of dropped packets"),
+        let total_drops_per_sec = GaugeVec::new(
+            Opts::new(
+                "kfree_skb_total_drops_per_sec",
+                "Dropped packets per second, 10s moving average",
+            ),
             &["reason"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create total_drops counter: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to create total_drops_per_sec gauge: {}", e))?;
 
         registry
-            .register(Box::new(total_drops.clone()))
-            .map_err(|e| anyhow::anyhow!("failed to register total_drops counter: {}", e))?;
+            .register(Box::new(total_drops_per_sec.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!("failed to register total_drops_per_sec gauge: {}", e)
+            })?;
 
-        let drops_by_reason = IntCounterVec::new(
+        let drops_per_sec = GaugeVec::new(
             Opts::new(
-                "kfree_skb_drops_by_reason",
-                "Number of dropped packets by reason",
+                "kfree_skb_drops_per_sec",
+                "Dropped packets per second by reason, 10s moving average",
             ),
             &["reason_code", "reason_name"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create drops_by_reason counter: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to create drops_per_sec gauge: {}", e))?;
 
         registry
-            .register(Box::new(drops_by_reason.clone()))
-            .map_err(|e| anyhow::anyhow!("failed to register drops_by_reason counter: {}", e))?;
+            .register(Box::new(drops_per_sec.clone()))
+            .map_err(|e| anyhow::anyhow!("failed to register drops_per_sec gauge: {}", e))?;
 
         Ok(Self {
-            total_drops,
-            drops_by_reason,
+            total_drops_per_sec,
+            drops_per_sec,
         })
     }
 }
@@ -76,9 +94,11 @@ pub struct KfreeSkbProgram {
     name: String,
     ebpf: Option<Ebpf>,
     metrics: Option<KfreeSkbMetrics>,
-    /// Last cumulative count seen per drop reason, used to compute deltas
-    /// for the Prometheus counters
+    /// Last cumulative count seen per drop reason, used to compute per-tick
+    /// deltas from the cumulative BPF counters
     last_counts: std::collections::HashMap<u32, u64>,
+    /// Per-tick drop deltas within the moving-average window, per reason
+    delta_windows: std::collections::HashMap<u32, VecDeque<(Instant, u64)>>,
 }
 
 impl KfreeSkbProgram {
@@ -89,6 +109,7 @@ impl KfreeSkbProgram {
             ebpf: None,
             metrics: None,
             last_counts: std::collections::HashMap::new(),
+            delta_windows: std::collections::HashMap::new(),
         }
     }
 
@@ -161,6 +182,22 @@ pub fn counter_delta(
     count.saturating_sub(prev)
 }
 
+/// Push a per-tick delta into the sliding window, evict entries older than
+/// RATE_WINDOW, and return the sum of the remaining deltas.
+pub fn update_window(window: &mut VecDeque<(Instant, u64)>, now: Instant, delta: u64) -> u64 {
+    if delta > 0 {
+        window.push_back((now, delta));
+    }
+    while let Some((t, _)) = window.front() {
+        if now.duration_since(*t) > RATE_WINDOW {
+            window.pop_front();
+        } else {
+            break;
+        }
+    }
+    window.iter().map(|(_, d)| d).sum()
+}
+
 impl MetricsDisplay for KfreeSkbProgram {
     fn set_metrics_registry(&mut self, registry: Arc<Registry>) -> anyhow::Result<()> {
         let metrics = KfreeSkbMetrics::new(registry)?;
@@ -194,39 +231,55 @@ impl MetricsDisplay for KfreeSkbProgram {
             all_counts.push((reason, reason_name, count));
         }
 
-        // Sort by count (descending)
-        all_counts.sort_by_key(|b| std::cmp::Reverse(b.2));
-
-        if all_counts.is_empty() {
-            trace!("No drops recorded yet");
-        } else {
-            // The BPF map holds cumulative counts since program load, so
-            // increment the Prometheus counters only by the delta since the
-            // last read; adding the full totals on every tick would count
-            // each drop multiple times.
-            let mut total_delta = 0u64;
-            for (reason, name, count) in &all_counts {
-                let delta = counter_delta(&mut self.last_counts, *reason, *count);
-                if delta == 0 {
-                    continue;
+        // The BPF map holds cumulative counts since program load; convert to
+        // per-tick deltas and average them over a sliding window, so the
+        // reported rate reflects recent traffic instead of growing forever.
+        let now = Instant::now();
+        let mut rows = Vec::new();
+        for (reason, name, count) in all_counts {
+            let delta = counter_delta(&mut self.last_counts, reason, count);
+            let sum = {
+                let window = self.delta_windows.entry(reason).or_default();
+                update_window(window, now, delta)
+            };
+            if sum == 0 {
+                // No drops within the window: the rate decayed to zero, drop
+                // the series and skip the reason in the output.
+                self.delta_windows.remove(&reason);
+                let label = [reason.to_string(), name.to_string()];
+                let label_refs: Vec<&str> = label.iter().map(String::as_str).collect();
+                if let Err(e) = metrics.drops_per_sec.remove_label_values(&label_refs) {
+                    debug!("failed to remove decayed drop-rate series {}: {}", name, e);
                 }
-                total_delta += delta;
-                metrics
-                    .drops_by_reason
-                    .with_label_values(&[&reason.to_string(), &name.to_string()])
-                    .inc_by(delta);
+                continue;
             }
-            if total_delta > 0 {
-                metrics
-                    .total_drops
-                    .with_label_values(&["all"])
-                    .inc_by(total_delta);
-            }
+            let rate = sum as f64 / RATE_WINDOW.as_secs_f64();
+            metrics
+                .drops_per_sec
+                .with_label_values(&[&reason.to_string(), &name.to_string()])
+                .set(rate);
+            rows.push((reason, name, rate));
+        }
 
-            let total: u64 = all_counts.iter().map(|(_, _, c)| *c).sum();
-            info!("Drop counts (total: {}):", total);
-            for (reason, name, count) in &all_counts {
-                info!("  {:3} ({:30}): {}", reason, name, count);
+        // Sort by rate (descending)
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        if rows.is_empty() {
+            trace!("No drops recorded in the last {}s", RATE_WINDOW.as_secs());
+        } else {
+            let total_rate: f64 = rows.iter().map(|(_, _, r)| *r).sum();
+            metrics
+                .total_drops_per_sec
+                .with_label_values(&["all"])
+                .set(total_rate);
+
+            info!(
+                "Drop rates (drops/sec, {}s moving average; total: {:.1}):",
+                RATE_WINDOW.as_secs(),
+                total_rate
+            );
+            for (reason, name, rate) in &rows {
+                info!("  {:3} ({:30}): {:.1}", reason, name, rate);
             }
         }
 
