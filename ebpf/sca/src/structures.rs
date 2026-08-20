@@ -50,3 +50,15 @@ pub struct SysEnterSendmsgArgs {
     pub fd: u64,
     pub msg: u64,
 }
+
+/// One sendmsg() on a tracked hop endpoint: the endpoint, the NNG header
+/// fields, and log-friendly process/socket names.
+pub struct SendEvent<'a> {
+    pub endpoint: &'a HopEndpoint,
+    pub pid: u32,
+    pub fd: u32,
+    pub proc_name: &'a str,
+    pub sock_path: &'a str,
+    pub protocol: u32,
+    pub msg_type: u16,
+}

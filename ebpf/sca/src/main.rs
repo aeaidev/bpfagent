@@ -13,8 +13,8 @@ use sca_common::SOCKET_HOPS_MAP_MAX_ENTRIES;
 mod helpers;
 mod structures;
 
-use helpers::{buf_to_log_str, read_nng_header};
-use structures::{HopEndpoint, SysEnterSendmsgArgs, UserMsgHdr};
+use helpers::{buf_to_log_str, pair_key, read_nng_header};
+use structures::{HopEndpoint, SendEvent, SysEnterSendmsgArgs, UserMsgHdr};
 
 /// Socket hops map - shared between eBPF and userspace
 /// Key: (pid << 32) | fd — unambiguous because fd numbers are per-process
@@ -25,17 +25,10 @@ use structures::{HopEndpoint, SysEnterSendmsgArgs, UserMsgHdr};
 pub static SOCKET_HOPS_MAP: HashMap<u64, HopEndpoint> =
     HashMap::with_max_entries(SOCKET_HOPS_MAP_MAX_ENTRIES, 0);
 
-/// Pack two u32s into a map key: `high` in the upper 32 bits, `low` in the
-/// lower. Used for (pid, fd) endpoint keys and (hop_index, protocol) latency
-/// keys alike.
-fn pair_key(high: u32, low: u32) -> u64 {
-    ((high as u64) << 32) | (low as u64)
-}
-
 /// Look up the hop endpoint for a given process and file descriptor.
 /// Returns a reference into the map value (valid for the program's lifetime).
 unsafe fn get_endpoint(pid: u32, fd: u32) -> Option<&'static HopEndpoint> {
-    unsafe { SOCKET_HOPS_MAP.get(&pair_key(pid, fd)) }
+    SOCKET_HOPS_MAP.get(&pair_key(pid, fd))
 }
 
 /// Timestamp map for latency calculation based on NNG Protocol field:
@@ -81,15 +74,8 @@ pub fn sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
 
 /// Tracepoint handler for sys_enter_sendmsg
 /// Measures per-hop latency using the NNG Protocol field, with socket filtering
-/// based on (pid, fd) endpoint lookup.
-///
-/// For each tracked socket hop:
-/// - When the hop's sending process sends TO the socket: store timestamp with
-///   (hop_index << 32) | Protocol as key
-/// - When the hop's receiving process sends FROM the socket (response): look up
-///   the timestamp with the same key and calculate the raw latency, then
-///   subtract the downstream hop's latency so the reported value is this
-///   hop's individual contribution, not the accumulated remainder of the chain
+/// based on (pid, fd) endpoint lookup: a send by the hop's sender stores a
+/// timestamp (REQ), a send by the hop's receiver computes the latency (REP).
 fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     let Some(args) = (unsafe { ctx.read_at::<SysEnterSendmsgArgs>(0).ok() }) else {
         return Ok(0);
@@ -97,21 +83,14 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
     let fd = args.fd as u32;
     let msg_ptr = args.msg;
 
-    // Get current process ID; PID is in the upper 32 bits
-    let current_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // Get current process name (comm) for human-readable logging
-    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
-    let mut name_buf = [0u8; 16];
-    let proc_name = buf_to_log_str(&comm, &mut name_buf);
+    // PID is in the upper 32 bits of pid_tgid
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
-    // Look up the hop endpoint by (pid, fd). fd numbers are per-process,
-    // so the pair is unambiguous even when two processes use the same
-    // numeric fd for different sockets.
-    let Some(endpoint) = (unsafe { get_endpoint(current_pid, fd) }) else {
+    // fd numbers are per-process, so (pid, fd) is unambiguous even when two
+    // processes use the same numeric fd for different sockets.
+    let Some(endpoint) = (unsafe { get_endpoint(pid, fd) }) else {
         return Ok(0); // Not a tracked endpoint, skip
     };
-    let mut path_buf = [0u8; 32];
-    let sock_path = buf_to_log_str(&endpoint.path, &mut path_buf);
 
     // Read the NNG header to get the protocol and message type
     let Some((protocol, msg_type)) = (unsafe { read_nng_header(msg_ptr as *const UserMsgHdr) })
@@ -119,47 +98,63 @@ fn sys_enter_sendmsg_handler(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0); // Not an NNG packet, skip
     };
 
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let mut name_buf = [0u8; 16];
+    let mut path_buf = [0u8; 32];
+    let event = SendEvent {
+        endpoint,
+        pid,
+        fd,
+        proc_name: buf_to_log_str(&comm, &mut name_buf),
+        sock_path: buf_to_log_str(&endpoint.path, &mut path_buf),
+        protocol,
+        msg_type,
+    };
+
     if endpoint.is_sender == 1 {
-        // This process is sending TO the listening socket (REQ): store timestamp
-        debug!(
-            &ctx,
-            "REQ: {} (pid {}) sent request to {} (fd {}): protocol=0x{:x}, msg_type=0x{:x}",
-            proc_name,
-            current_pid,
-            sock_path,
-            fd,
-            protocol,
-            msg_type
-        );
-        unsafe {
-            store_timestamp_with_protocol(&ctx, endpoint.hop_index, protocol);
-        }
+        handle_request(&ctx, &event);
     } else {
-        // This process is sending FROM the listening socket (REP):
-        // look up the timestamp and calculate latency. The raw value
-        // accumulates all downstream hops (the REP goes out only after
-        // the downstream REP arrived), so subtract the downstream hop's
-        // latency to get this hop's individual contribution.
-        let latency = unsafe { lookup_timestamp_with_protocol(&ctx, endpoint.hop_index, protocol) };
-        if latency > 0 {
-            let individual =
-                unsafe { subtract_downstream_latency(endpoint.hop_index, protocol, latency) };
-            let current_time = unsafe { bpf_ktime_get_ns() };
-            unsafe { update_moving_average(&ctx, current_pid, individual, current_time) }
-            debug!(
-                &ctx,
-                "REP: {} (pid {}) send reply from {} (fd {}): matched protocol=0x{:x}, msg_type=0x{:x}, latency={} ns",
-                proc_name,
-                current_pid,
-                sock_path,
-                fd,
-                protocol,
-                msg_type,
-                individual
-            );
-        }
+        handle_response(&ctx, &event);
     }
     Ok(0)
+}
+
+/// REQ arm: the hop's sender sent TO the socket — store the send timestamp
+/// for the (hop, protocol) pair.
+fn handle_request(ctx: &TracePointContext, ev: &SendEvent) {
+    debug!(
+        ctx,
+        "REQ: {} (pid {}) sent request to {} (fd {}): protocol=0x{:x}, msg_type=0x{:x}",
+        ev.proc_name,
+        ev.pid,
+        ev.sock_path,
+        ev.fd,
+        ev.protocol,
+        ev.msg_type
+    );
+    unsafe {
+        store_timestamp_with_protocol(ctx, ev.endpoint.hop_index, ev.protocol);
+    }
+}
+
+/// REP arm: the hop's receiver sent FROM the socket — compute the latency
+/// since the matching REQ. The raw value accumulates all downstream hops
+/// (the REP goes out only after the downstream REP arrived), so subtract the
+/// downstream hop's latency to report this hop's individual contribution.
+fn handle_response(ctx: &TracePointContext, ev: &SendEvent) {
+    let hop = ev.endpoint.hop_index;
+    let latency = unsafe { lookup_timestamp_with_protocol(ctx, hop, ev.protocol) };
+    if latency == 0 {
+        return;
+    }
+    let individual = unsafe { subtract_downstream_latency(hop, ev.protocol, latency) };
+    let current_time = unsafe { bpf_ktime_get_ns() };
+    unsafe { update_moving_average(ctx, ev.pid, individual, current_time) };
+    debug!(
+        ctx,
+        "REP: {} (pid {}) send reply from {} (fd {}): matched protocol=0x{:x}, msg_type=0x{:x}, latency={} ns",
+        ev.proc_name, ev.pid, ev.sock_path, ev.fd, ev.protocol, ev.msg_type, individual
+    );
 }
 
 /// Store the send timestamp for a (hop, protocol) pair.
@@ -184,28 +179,26 @@ unsafe fn lookup_timestamp_with_protocol(
     protocol: u32,
 ) -> u64 {
     let key = pair_key(hop_index, protocol);
-
     trace!(
         &ctx,
         "Looking up timestamp for hop={}, protocol=0x{:x}",
         hop_index,
         protocol
     );
-    if let Some(stored_time) = TIMESTAMP_MAP.get(&key) {
-        let current_time = bpf_ktime_get_ns();
-        let latency = current_time - *stored_time;
-        let _ = TIMESTAMP_MAP.remove(&key);
-        trace!(&ctx, "Found latency={}", latency);
-        latency
-    } else {
+
+    let Some(stored_time) = TIMESTAMP_MAP.get(&key) else {
         trace!(
             &ctx,
             "Timestamp not found for hop={}, protocol=0x{:x}",
             hop_index,
             protocol
         );
-        0
-    }
+        return 0;
+    };
+    let latency = bpf_ktime_get_ns() - *stored_time;
+    let _ = TIMESTAMP_MAP.remove(&key);
+    trace!(&ctx, "Found latency={}", latency);
+    latency
 }
 
 /// Turn an accumulated hop latency into this hop's individual contribution.
@@ -248,20 +241,18 @@ unsafe fn update_moving_average(
     let mut count = LATENCY_PID_COUNT.get(&pid).copied().unwrap_or(0);
     let window_start = LATENCY_WINDOW_START.get(&pid).copied().unwrap_or(0);
 
-    // Check if we need to slide the window (more than WINDOW_SIZE_NS has passed)
+    // Slide the window once it expires; anchor it at the first sample.
     if current_time - window_start > WINDOW_SIZE_NS {
-        // Reset the window
         sum = 0;
         count = 0;
-        LATENCY_WINDOW_START.insert(&pid, &current_time, 0).ok();
         trace!(
             ctx,
             "Sliding window reset for PID {} at time {}",
             pid,
             current_time
         );
-    } else if count == 0 {
-        // First sample in window
+    }
+    if count == 0 {
         LATENCY_WINDOW_START.insert(&pid, &current_time, 0).ok();
     }
 

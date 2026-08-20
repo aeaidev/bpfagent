@@ -1,9 +1,16 @@
-//! Helpers for reading and parsing user-space memory: extracting the NNG
-//! header of a sendmsg() message, which may be split across several iovecs.
+//! Helpers for the SCA eBPF program: map-key packing, user-space memory
+//! reads, NNG header parsing, and log-string conversion.
 
 use aya_ebpf::helpers::bpf_probe_read_user;
 
 use crate::structures::{IoVec, UserMsgHdr};
+
+/// Pack two u32s into a map key: `high` in the upper 32 bits, `low` in the
+/// lower. Used for (pid, fd) endpoint keys and (hop_index, protocol) latency
+/// keys alike.
+pub fn pair_key(high: u32, low: u32) -> u64 {
+    ((high as u64) << 32) | (low as u64)
+}
 
 /// NNG header field sizes
 const NNG_SPF_SIZE: usize = 9; // NNG SPF (Socket Protocol Framework) header
