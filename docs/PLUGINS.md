@@ -9,10 +9,16 @@ A plugin consists of three parts:
 2. **Shared types** - common structures between kernel and userspace
 3. **Userspace handler** - collects and displays metrics
 
+> Writing the kernel program in C instead of Rust? See
+> [PLUGINS_C.md](PLUGINS_C.md).
+
 ## Quick Start
 
 A copy-ready template for the userspace program module (step 3) is also
-available at [`docs/templates/custom_program.rs`](templates/custom_program.rs).
+available at [`docs/templates/custom_program.rs`](templates/custom_program.rs),
+and a complete worked example matching both the Rust and
+[C](PLUGINS_C.md) kernel templates at
+[`docs/templates/custom.rs`](templates/custom.rs).
 
 ### 1. Create eBPF Program Directory
 
