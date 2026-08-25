@@ -45,6 +45,38 @@ name = "sca"
 }
 
 #[test]
+fn program_settings_table_parses() {
+    let cfg: DaemonConfig = toml::from_str(
+        r#"
+pid_file = "/p"
+working_directory = "/"
+log_file = "/l"
+
+[[ebpf_programs]]
+name = "irss"
+
+[ebpf_programs.settings]
+raw_dest = "192.0.2.1"
+"#,
+    )
+    .expect("config should parse");
+    let settings = cfg.ebpf_programs[0]
+        .settings
+        .as_ref()
+        .expect("settings table should be present");
+    assert_eq!(
+        settings.get("raw_dest").and_then(|v| v.as_str()),
+        Some("192.0.2.1")
+    );
+}
+
+#[test]
+fn program_settings_default_to_none() {
+    let cfg: DaemonConfig = toml::from_str(FULL_TOML).expect("full config should parse");
+    assert!(cfg.ebpf_programs[0].settings.is_none());
+}
+
+#[test]
 fn missing_daemon_keys_are_an_error() {
     // Documents current behavior: pid_file, working_directory and log_file
     // are mandatory in the config file.

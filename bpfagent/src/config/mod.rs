@@ -2,4 +2,4 @@
 
 pub mod loader;
 
-pub use loader::DaemonConfig;
+pub use loader::{DaemonConfig, EbpfProgramConfig};

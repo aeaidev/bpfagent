@@ -13,3 +13,11 @@ enabled = true
 [[ebpf_programs]]
 name = "sca"
 enabled = true
+
+[[ebpf_programs]]
+name = "irss"
+enabled = true
+# Optional: IRSS flow settings (defaults: listen_port 5020, raw_dest 10.10.10.253)
+# [ebpf_programs.settings]
+# listen_port = 5020
+# raw_dest = "10.10.10.253"

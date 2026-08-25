@@ -172,6 +172,7 @@ Then register it in `bpfagent/src/app.rs` (`register_programs`):
 ```rust
 fn register_programs() -> ProgramRegistry {
     let mut registry = ProgramRegistry::new();
+    crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::sca::init(&mut registry);
     crate::programs::my_program::init(&mut registry);  // Add this
@@ -194,7 +195,7 @@ members = [
 2. Add the package name to the match in `bpfagent/build.rs`, which discovers
 eBPF packages from workspace metadata and builds them with aya-build:
 ```rust
-"kfree_skb-ebpf" | "sca-ebpf" | "my_program-ebpf" => {
+"irss-ebpf" | "kfree_skb-ebpf" | "sca-ebpf" | "my_program-ebpf" => {
 ```
 
 The compiled binary lands in `OUT_DIR` under its `[[bin]]` name
@@ -308,6 +309,36 @@ impl EbpfProgram for CounterProgram {
 Without these overrides the program loads and runs, but its metrics are
 never registered or displayed. See [Metrics not
 appearing](#metrics-not-appearing) if your metrics are missing.
+
+### Program Settings: `configure()`
+
+A program can accept its own free-form settings table from the config file
+by overriding the optional `EbpfProgram::configure` hook. It is called once
+after creation, before `load()`, with the program's `[[ebpf_programs]]`
+entry; the default implementation ignores all settings:
+
+```toml
+[[ebpf_programs]]
+name = "counter"
+enabled = true
+
+[ebpf_programs.settings]
+threshold = "100"
+```
+
+```rust
+fn configure(&mut self, config: &EbpfProgramConfig) -> anyhow::Result<()> {
+    // read config.settings (Option<toml::Table>), keep defaults for
+    // missing/invalid values
+    Ok(())
+}
+```
+
+Runtime values reach the eBPF program through a small config map written in
+`load()` before attaching (like SCA populates SOCKET_HOPS_MAP); the eBPF
+side should fall back to a compiled-in default when the map entry is absent.
+See `bpfagent/src/programs/irss/mod.rs` (`raw_dest` -> RAW_DEST_MAP) for a
+real example.
 
 ## Testing Your Plugin
 

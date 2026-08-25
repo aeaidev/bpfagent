@@ -1,7 +1,10 @@
 //! BPF Program Traits and Interfaces
 
-use aya::Ebpf;
 use std::any::Any;
+
+use aya::Ebpf;
+
+use crate::config::EbpfProgramConfig;
 
 /// Trait for eBPF programs that support metrics display and export
 pub trait MetricsDisplay {
@@ -74,6 +77,19 @@ pub trait EbpfProgram: EbpfAccess {
     /// Used internally to access program-specific functionality
     #[allow(dead_code)]
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Apply program-specific settings from the config file
+    ///
+    /// Called once after creation, before `load()`, with the program's
+    /// `[[ebpf_programs]]` entry. Programs that accept optional settings
+    /// (a `[ebpf_programs.settings]` table) override this; the default
+    /// ignores all settings.
+    ///
+    /// # Errors
+    /// Returns error if a setting is present but invalid
+    fn configure(&mut self, _config: &EbpfProgramConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Check if this program supports metrics display
     ///

@@ -29,6 +29,19 @@ name = "sca"
 enabled = true
 # Traces socket communication latency per process (NNG protocol)
 
+[[ebpf_programs]]
+name = "irss"
+enabled = true
+# Measures UDP-to-raw-IP forwarding latency (CRYPTO -> IRSS -> MAC data flow)
+# Optional program settings (defaults shown):
+[ebpf_programs.settings]
+# UDP port IRSS listens on (from CRYPTO); the RX filter only timestamps
+# datagrams received on this port
+listen_port = 5020
+# Raw-IP destination of the IRSS data flow (MAC); the TX filter only matches
+# sendmsg() calls addressed here
+raw_dest = "10.10.10.253"
+
 
 # Usage Notes
 # ===========

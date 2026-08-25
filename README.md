@@ -4,6 +4,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 
 - **kfree_skb** - traces kernel packet drops
 - **SCA** - traces socket communication latency per process
+- **IRSS** - measures UDP-to-raw-IP forwarding latency
 
 ## Quick Links
 
@@ -39,6 +40,16 @@ For each hop, it:
 3. Calculates latency as the timestamp difference
 
 Latencies are tracked using a sliding window moving average (2-second window) and exported via Prometheus.
+
+### IRSS Program
+
+The IRSS program measures how long the IRSS component holds one datagram, from the incoming UDP packet (from CRYPTO to the listen port, default 5020) to the outgoing raw-IP packet (to the configured destination, default 10.10.10.253) — see [IRSS Data Flow](docs/IRSS.md):
+
+1. On UDP receive (kprobe on `udp_recvmsg` filtered by listen port + `sys_exit_recvmsg`): stores the receipt timestamp keyed by the datagram's first 4 payload bytes
+2. On raw-IP send (`sys_enter_sendmsg` towards the configured destination): looks up the same key; on a match it removes the record and accumulates the latency
+3. Userspace turns the cumulative accumulators into a periodic moving average (per-interval average) exported via Prometheus
+
+Both filters are configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`); unlike SCA, no PID/FD discovery (`ss`/`lsof`) is needed.
 
 ## Quick Start
 
@@ -91,6 +102,15 @@ enabled = true
 [[ebpf_programs]]
 name = "sca"
 enabled = true
+
+[[ebpf_programs]]
+name = "irss"
+enabled = true
+
+# Optional program-specific settings (defaults shown)
+# [ebpf_programs.settings]
+# listen_port = 5020              # IRSS UDP listen port (CRYPTO side)
+# raw_dest = "10.10.10.253"       # IRSS raw-IP destination (MAC)
 ```
 
 ### Config File Locations
@@ -123,6 +143,11 @@ Use the `-f/--config-file` option to specify a custom config file path.
     each hop's individual contribution rather than the accumulated chain
   - Tracks moving average latency per process name (2-second sliding window)
   - Exports metrics via Prometheus with process name labels
+- **IRSS program** - measures UDP-to-raw-IP forwarding latency
+  - On UDP receive (listen-port filtered kprobe): stores timestamp keyed by the first 4 payload bytes
+  - On raw-IP send to the configured destination (default 10.10.10.253): matches the key, removes it, accumulates latency
+  - Filters configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`), no PID/FD discovery needed
+  - Exports a per-interval moving average via Prometheus
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
 - **Clean code organization** - separates concerns into modules (common, config, programs, metrics)
@@ -144,6 +169,7 @@ Use the `-f/--config-file` option to specify a custom config file path.
    - BPF support (CONFIG_BPF=y)
    - Tracepoint support for `skb:kfree_skb` (for kfree_skb program)
    - Tracepoint support for `syscalls:sys_enter_sendmsg` (for SCA program)
+   - Tracepoint support for `syscalls:sys_exit_recvmsg`/`sys_enter_sendmsg` and kprobe support for `udp_recvmsg` (for IRSS program)
    - BTF debug info (CONFIG_DEBUG_INFO_BTF=y) - for best compatibility
 
 ## Build & Run
@@ -158,6 +184,7 @@ The application supports two running modes:
 - Displays statistics to stdout every 3 seconds
   - For kfree_skb: drop counts by reason
   - For SCA: moving average latency per process name
+  - For IRSS: average UDP-to-raw-IP forwarding latency
 
 **Daemon Mode**
 - Runs in the background without stdout output
@@ -287,6 +314,12 @@ scrape_configs:
 |--------|------|--------|-------------|
 | `sca_avg_latency_per_pname` | Gauge | `pname` | Moving average of the individual hop latency in microseconds per process name (raw REQ/REP timestamp difference minus the downstream hop's latency) |
 
+#### IRSS Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `irss_avg_latency_us` | Gauge | | Average UDP-to-raw-IP forwarding latency in microseconds (per-interval moving average; 0 when no traffic) |
+
 ### Metrics Output Example
 
 #### kfree_skb
@@ -313,6 +346,16 @@ The SCA program calculates latency per hop; see [SCA Data Flow](docs/SCA_DATA_FL
  sca_avg_latency_per_pname{pname="FRAGMENTER (PID 1237)"} 34985
 ```
 
+#### IRSS
+
+The IRSS program averages the per-datagram forwarding latency over each display interval; see [IRSS Data Flow](docs/IRSS.md) for the tag keying and destination filtering details.
+
+```
+# HELP irss_avg_latency_us Average UDP-to-raw-IP forwarding latency in microseconds (per-interval moving average)
+# TYPE irss_avg_latency_us gauge
+ irss_avg_latency_us 12167
+```
+
 ## Output Example
 
 ### kfree_skb Output
@@ -333,6 +376,14 @@ The SCA program tracks latency per receiving process for each hop (keying detail
 --- Moving Average Latency per PID ---
   INTERNAL_ROUTER (PID 1234): 60769 us (count: 2) path=/tmp/DATA_L3_TO_INTERNAL_ROUTER
   FRAGMENTER (PID 1237): 34985 us (count: 4) path=/tmp/WF_L_TO_FRAG, /tmp/IRSS_L_TO_FRAG
+```
+
+### IRSS Output
+
+The IRSS program reports the average forwarding latency over each display interval (see [IRSS Data Flow](docs/IRSS.md)):
+
+```
+IRSS forwarding latency: 12167 us (3 samples, UDP:5020 -> raw IP 10.10.10.253)
 ```
 
 ## Mapping Drop Reasons
@@ -362,14 +413,18 @@ bpfagent/
 │   │   ├── config/     # Config file parsing and daemon settings
 │   │   ├── metrics/    # Prometheus metrics HTTP server
 │   │   └── programs/   # Program registry, traits, and eBPF program modules
+│   │       ├── irss/       # IRSS-specific logic (metrics, display)
 │   │       ├── kfree_skb/  # kfree_skb-specific logic (metrics, display)
 │   │       └── sca/        # SCA-specific logic (metrics, display, hop discovery)
 │   └── examples/
+│       ├── irss_sim.rs # IRSS data-flow simulator for end-to-end testing
 │       └── sca_sim.rs  # SCA pipeline simulator for end-to-end testing
 ├── common/
+│   ├── irss/           # Shared types between user and eBPF code
 │   ├── kfree_skb/      # Shared types between user and eBPF code
 │   └── sca/            # Shared types between user and eBPF code
 └── ebpf/
+    ├── irss/           # Kernel-space eBPF program source
     ├── kfree_skb/      # Kernel-space eBPF program source
     └── sca/            # Kernel-space eBPF program source
 ```
@@ -388,6 +443,13 @@ bpfagent/
 - `ebpf/sca/src/main.rs` - eBPF program that matches NNG Protocol timestamps per hop for latency calculation
 - `common/sca/src/lib.rs` - Common types (hop endpoints, data flow, tracepoints)
 - `bpfagent/examples/sca_sim.rs` - SCA pipeline simulator for end-to-end testing
+
+#### IRSS
+
+- `bpfagent/src/programs/irss/mod.rs` - IRSS-specific logic (metrics, display)
+- `ebpf/irss/src/main.rs` - eBPF program that matches payload-tag timestamps for UDP-to-raw-IP latency calculation
+- `common/irss/src/lib.rs` - Common types (tracepoints, tag size, raw-IP destination)
+- `bpfagent/examples/irss_sim.rs` - IRSS data-flow simulator for end-to-end testing
 
 **SCA Latency Calculation:**
 - Uses a combined key of hop index (4B) + Protocol (4B) to match REQ/REP message pairs

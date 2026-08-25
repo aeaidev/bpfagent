@@ -19,6 +19,14 @@
 //! [[ebpf_programs]]
 //! name = "sca"
 //! enabled = true
+//!
+//! # Program-specific settings (optional, interpreted by the program)
+//! [[ebpf_programs]]
+//! name = "irss"
+//! enabled = true
+//!
+//! [ebpf_programs.settings]
+//! raw_dest = "10.10.10.253"
 //! ```
 //!
 //! # Search Paths
@@ -43,6 +51,10 @@ pub struct EbpfProgramConfig {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional program-specific settings (free-form TOML table, interpreted
+    /// by the program via `EbpfProgram::configure`)
+    #[serde(default)]
+    pub settings: Option<toml::Table>,
 }
 
 fn default_true() -> bool {

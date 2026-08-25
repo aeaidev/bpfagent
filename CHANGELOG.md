@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sca_sim` space-bar pause: pressing SPACE in the simulator's terminal
   SIGSTOP/SIGCONTs the initiator, pausing/resuming the data flow without
   tearing down the pipeline
+- IRSS eBPF program: measures UDP-to-raw-IP forwarding latency of the IRSS
+  data flow (CRYPTO -> IRSS -> MAC, docs/IRSS.md). RX timestamps are keyed by
+  the first 4 payload bytes (`sys_enter_recvmsg`/`sys_exit_recvmsg`), matched
+  on raw-IP sends to 10.10.10.253 (`sys_enter_sendmsg`, filtered by the
+  sendmsg destination address), and exported as the `irss_avg_latency_us`
+  per-interval moving-average gauge
+- IRSS data-flow simulator example (`bpfagent/examples/irss_sim.rs`) for
+  end-to-end testing
+- IRSS raw-IP destination is now configurable via
+  `[ebpf_programs.settings] raw_dest = "..."` (default 10.10.10.253);
+  userspace writes it into the new `RAW_DEST_MAP` at load time and the TX
+  filter matches on the configured address
+- IRSS UDP listen port is now configurable via
+  `[ebpf_programs.settings] listen_port = ...` (default 5020); the RX side
+  moved from an unfiltered `sys_enter_recvmsg` tracepoint to a kprobe on
+  `udp_recvmsg` that checks the socket's local port (`LISTEN_PORT_MAP`), so
+  unrelated receive traffic is filtered out too
 
 ### Changed
 - Improved code organization with logical modules

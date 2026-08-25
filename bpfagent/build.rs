@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     for package in packages {
         let name = package.name.clone();
         match name.as_str() {
-            "kfree_skb-ebpf" | "sca-ebpf" => {
+            "irss-ebpf" | "kfree_skb-ebpf" | "sca-ebpf" => {
                 names.push(name.to_string());
                 let manifest_path = package.manifest_path.clone();
                 let root_dir = manifest_path

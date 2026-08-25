@@ -2,12 +2,14 @@
 resolver = "2"
 members = [
     "bpfagent",
+    "common/irss",
     "common/kfree_skb",
     "common/sca",
+    "ebpf/irss",
     "ebpf/kfree_skb",
     "ebpf/sca",
 ]
-default-members = ["bpfagent", "common/kfree_skb", "common/sca"]
+default-members = ["bpfagent", "common/irss", "common/kfree_skb", "common/sca"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

@@ -23,6 +23,7 @@ fn register_programs() -> ProgramRegistry {
 
     // Initialize all program modules - each module registers itself
     // To add a new program, add its module and call its init function here
+    crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::sca::init(&mut registry);
 
@@ -54,36 +55,54 @@ fn load_programs(
         program_registry.available_programs()
     );
 
-    // Get enabled programs from config
-    let enabled_program_names: Vec<String> = daemon_config
+    // Get enabled program entries from config
+    let enabled_program_configs: Vec<&config::EbpfProgramConfig> = daemon_config
         .ebpf_programs
         .iter()
         .filter(|p| p.enabled)
-        .map(|p| p.name.clone())
         .collect();
 
     // If no programs specified in config, enable all registered programs
-    let enabled_program_names = if enabled_program_names.is_empty() {
-        info!("No programs in config, enabling all registered programs");
-        program_registry.available_programs()
-    } else {
-        enabled_program_names
-    };
-    info!("Enabled programs: {:?}", enabled_program_names);
+    // with default (empty) per-program settings
+    let default_configs: Vec<config::EbpfProgramConfig>;
+    let enabled_program_configs: Vec<&config::EbpfProgramConfig> =
+        if enabled_program_configs.is_empty() {
+            info!("No programs in config, enabling all registered programs");
+            default_configs = program_registry
+                .available_programs()
+                .into_iter()
+                .map(|name| config::EbpfProgramConfig {
+                    name,
+                    enabled: true,
+                    settings: None,
+                })
+                .collect();
+            default_configs.iter().collect()
+        } else {
+            enabled_program_configs
+        };
+    info!(
+        "Enabled programs: {:?}",
+        enabled_program_configs
+            .iter()
+            .map(|p| &p.name)
+            .collect::<Vec<_>>()
+    );
 
-    if enabled_program_names.is_empty() {
+    if enabled_program_configs.is_empty() {
         info!("No programs enabled, exiting");
         return Ok(HashMap::new());
     }
 
-    // Create program instances based on enabled names
+    // Create and configure program instances based on enabled configs
     let mut programs = HashMap::new();
-    for program_name in &enabled_program_names {
-        let program = program_registry
-            .create_program(program_name)
-            .ok_or_else(|| anyhow::anyhow!("failed to create program {}", program_name))?;
+    for program_config in enabled_program_configs {
+        let mut program = program_registry
+            .create_program(&program_config.name)
+            .ok_or_else(|| anyhow::anyhow!("failed to create program {}", program_config.name))?;
+        program.configure(program_config)?;
 
-        programs.insert(program_name.clone(), program);
+        programs.insert(program_config.name.clone(), program);
     }
     info!("Loaded {} programs", programs.len());
     Ok(programs)

@@ -250,6 +250,7 @@ pub fn init(registry: &mut ProgramRegistry) {
 ```rust
 fn register_programs() -> ProgramRegistry {
     let mut registry = ProgramRegistry::new();
+    crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::sca::init(&mut registry);
     crate::programs::my_program::init(&mut registry);  // Add this

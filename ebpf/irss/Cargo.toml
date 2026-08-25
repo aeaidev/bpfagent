@@ -1,0 +1,17 @@
+[package]
+name = "irss-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+irss-common = { path = "../../common/irss" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "irss"
+path = "src/main.rs"
