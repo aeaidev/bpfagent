@@ -15,6 +15,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - ⚙️ **[Configuration](config/bpfagent.conf.full)** - Full config options
 - 🐳 **[Examples](examples/)** - Deployment examples (Docker; systemd unit in [config/systemd/](config/systemd/))
 - 📋 **[Changelog](CHANGELOG.md)** - Version history
+- 📚 **[Man Page](docs/bpfagent.1)** - Command-line reference
 
 ## Overview
 
@@ -458,3 +459,19 @@ bpfagent/
 - Raw latency = current_timestamp - stored_timestamp on match; the downstream
   hop's latency for the same message is then subtracted (LATENCY_HOP_MAP), so
   the reported value is each hop's individual contribution
+
+## Man Page
+
+To view the man page:
+
+```bash
+man -l docs/bpfagent.1
+```
+
+To install system-wide:
+
+```bash
+sudo cp docs/bpfagent.1 /usr/local/share/man/man1/
+sudo mandb
+man bpfagent
+```

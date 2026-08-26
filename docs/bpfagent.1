@@ -1,0 +1,259 @@
+.TH BPFAGENT 1 "August 2026" "bpfagent 0.1.0" "User Manual"
+
+.SH NAME
+bpfagent \- EBPF program manager and Prometheus metrics extractor
+
+.SH SYNOPSIS
+.B bpfagent
+[\fIOPTIONS\fR]
+
+.SH DESCRIPTION
+.B bpfagent
+is a daemon that loads eBPF programs and exposes their metrics to Prometheus.
+It provides a modular architecture for running multiple eBPF programs and
+exporting statistics via an HTTP-based metrics endpoint.
+
+.SH eBPF PROGRAMS
+
+The following eBPF programs are supported:
+
+.TP
+.B kfree_skb
+Traces packet drops at the kernel's \fIkfree_skb\fR tracepoint. Counts drops by
+reason (e.g., TCP_CSUM, NO_SOCKET, QDISC_DROP, etc.) and displays drop
+statistics.
+
+.TP
+.B sca
+Traces socket communication latency per process. Measures latency based on
+socket path + direction (TO/FROM) matching, tracking moving average latency
+per process name (2-second sliding window).
+
+.TP
+.B irss
+Measures UDP-to-raw-IP forwarding latency. On UDP receive (port-filtered
+kprobe): stores timestamp keyed by the first 4 payload bytes. On raw-IP send
+to the configured destination: matches the key, removes it, accumulates
+latency.
+
+.SH OPTIONS
+
+.TP
+.BR \-d ", " \-\-daemon
+Run in daemon mode (background, no stdout output). The process detaches from
+the controlling terminal and runs in the background.
+
+.TP
+.BR \-i ", " \-\-metrics\-ip \fIADDRESS\fR
+Set the metrics server IP address. Default: 0.0.0.0 (all interfaces).
+
+.TP
+.BR \-p ", " \-\-metrics\-port \fIPORT\fR
+Set the metrics server port. Default: 9101.
+
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output. This overrides daemon mode and outputs to stdout for
+interactive debugging.
+
+.TP
+.BR \-f ", " \-\-config\-file \fIPATH\fR
+Path to configuration file. If not specified, the following default paths are
+searched:
+.IP
+/etc/bpfagent.conf
+.br
+/etc/bpfagent/bpfagent.conf
+.br
+/usr/local/etc/bpfagent.conf
+.br
+/usr/local/etc/bpfagent/bpfagent.conf
+.br
+~/.bpfagent.conf (if HOME is set)
+.br
+~/.config/bpfagent/config.toml (if HOME is set)
+.br
+./bpfagent.conf (current directory for development)
+
+.TP
+.BR \-h ", " \-\-help
+Display help information.
+
+.TP
+.BR \-V ", " \-\-version
+Display version information.
+
+.SH CONFIGURATION FILE
+
+The configuration file uses TOML format and controls daemon settings and eBPF
+program loading:
+
+.EX
+# Daemon settings
+pid_file = "/tmp/bpfagent.pid"
+working_directory = "/"
+log_file = "/tmp/bpfagent.log"
+
+# EBPF programs to load and run
+[[ebpf_programs]]
+name = "kfree_skb"
+enabled = true
+
+[[ebpf_programs]]
+name = "sca"
+enabled = true
+
+[[ebpf_programs]]
+name = "irss"
+enabled = true
+
+# Optional program-specific settings
+[ebpf_programs.settings]
+listen_port = 5020        # IRSS UDP listen port (CRYPTO side)
+raw_dest = "10.10.10.253" # IRSS raw-IP destination (MAC)
+.EE
+
+.SH METRICS ENDPOINT
+
+The metrics server listens on the configured IP and port (default 0.0.0.0:9101)
+and exposes metrics in Prometheus format at the /metrics path.
+
+Example access:
+.IP
+curl http://localhost:9101/metrics
+
+.SH PROMETHEUS CONFIGURATION
+
+Add the following to your Prometheus \fIscrape_configs\fR:
+
+.EX
+scrape_configs:
+  - job_name: 'bpfagent'
+    static_configs:
+      - targets: ['localhost:9101']
+.EE
+
+.SH PREREQUISITES
+
+.IP \(bu 2
+Linux kernel 5.8+ with BPF support
+
+.IP \(bu 2
+Rust and Cargo
+
+.IP \(bu 2
+bpf-linker: \fBcargo install bpf-linker\fR
+
+.IP \(bu 2
+BPF tracepoint support for the enabled programs:
+.RS
+.IP \(bu 2
+skb:kfree_skb (for kfree_skb program)
+.IP \(bu 2
+syscalls:sys_enter_sendmsg, syscalls:sys_exit_recvmsg (for SCA and IRSS programs)
+.IP \(bu 2
+kprobe support for udp_recvmsg (for IRSS program)
+.RE
+
+.IP \(bu 2
+BTF debug info (CONFIG_DEBUG_INFO_BTF=y) recommended for best compatibility
+
+.SH EXAMPLES
+
+.TP
+Run in interactive mode (default):
+.IP
+sudo bpfagent
+
+.TP
+Run in daemon mode:
+.IP
+sudo bpfagent -d
+
+.TP
+Run with custom config file:
+.IP
+sudo bpfagent -f /etc/bpfagent.conf
+
+.TP
+Run in verbose mode (overrides daemon mode):
+.IP
+sudo bpfagent -v
+
+.TP
+Listen on localhost only with custom port:
+.IP
+sudo bpfagent -i 127.0.0.1 -p 9999
+
+.SH FILES
+
+.TP
+.B /etc/bpfagent.conf
+Default system-wide configuration file location.
+
+.TP
+.B /tmp/bpfagent.pid
+Default location for the PID file when running as a daemon.
+
+.TP
+.B /tmp/bpfagent.log
+Default location for the log file when running as a daemon.
+
+.SH EXIT STATUS
+
+.TP
+.B 0
+Success.
+
+.TP
+.B 1
+Error (e.g., failed to load eBPF programs, invalid configuration, permission denied).
+
+.SH BUGS
+
+Report bugs at: https://github.com/katim/bpfagent/issues
+
+.SH AUTHOR
+
+Katim LLC <contact@katim.io>
+
+.SH COPYRIGHT
+
+Copyright (C) 2026 Katim LLC. License: MIT OR Apache-2.0.
+
+.SH INSTALLATION
+
+To install bpfagent on your system:
+
+.EX
+# Build from source
+git clone https://github.com/katim/bpfagent.git
+cd bpfagent
+./scripts/setup.sh
+cargo build --release
+
+# Install manually
+sudo cp target/x86_64-unknown-linux-gnu/release/bpfagent /usr/local/bin/
+sudo mkdir -p /etc
+sudo cp bpfagent.conf /etc/bpfagent.conf
+
+# Optional: Copy man page
+sudo mkdir -p /usr/local/share/man/man1
+sudo cp docs/bpfagent.1 /usr/local/share/man/man1/
+sudo mandb
+.EE
+
+For package-based installation (when available), use:
+
+.EX
+# Debian/Ubuntu (.deb package)
+sudo dpkg -i bpfagent_*.deb
+
+# CentOS/RHEL (.rpm package)
+sudo rpm -ivh bpfagent-*.rpm
+.EE
+
+.SH SEE ALSO
+
+.BR bpftool (8),
+.BR perf (1)
