@@ -42,11 +42,20 @@ anyhow = { workspace = true, default-features = false }
 [package.metadata.deb]
 name = "bpfagent"
 maintainer = "Katim LLC <contact@katim.io>"
-section = "net"
+section = "utils"
 priority = "optional"
 depends = "$auto"
 conf-files = ["/etc/bpfagent.conf"]
 suggests = "libbpf1, libelf1"
+# Sources starting with target/release/ are treated as build artifacts and
+# follow --target; other sources are relative to this manifest's directory.
+assets = [
+    ["target/release/bpfagent", "usr/local/bin/", "755"],
+    ["../bpfagent.conf", "etc/bpfagent.conf", "644"],
+    ["../config/systemd/bpfagent.service", "etc/systemd/system/bpfagent.service", "644"],
+    ["../README.md", "usr/share/doc/bpfagent/README.md", "644"],
+    ["../docs/bpfagent.1", "usr/share/man/man1", "644"],
+]
 extended-description = """EBPF program manager and Prometheus metrics extractor
 
 A daemon that loads EBPF programs and exposes metrics to Prometheus."""

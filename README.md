@@ -264,6 +264,46 @@ CC=aarch64-linux-musl-gcc cargo build --package bpfagent --release \
 # target/aarch64-unknown-linux-musl/release/bpfagent
 ```
 
+### Building a Debian package
+
+The package layout is defined in `[package.metadata.deb]` in [bpfagent/Cargo.toml](bpfagent/Cargo.toml). Build it with [cargo-deb](https://github.com/kornelski/cargo-deb):
+
+```bash
+# Install the tool (once)
+cargo install cargo-deb
+
+# Package for the aarch64 target (static musl binary)
+cargo deb -p bpfagent --target aarch64-unknown-linux-musl
+# -> target/debian/bpfagent_<version>-1_arm64.deb
+
+# Package for the build host (x86_64)
+cargo deb -p bpfagent
+# -> target/debian/bpfagent_<version>-1_amd64.deb
+```
+
+Notes:
+
+- Run from the repository root; `-p bpfagent` is required because the workspace root has no package of its own.
+- To repackage an already-built binary without recompiling, add `--no-build`.
+- Dependency auto-detection (`depends = "$auto"`) needs `dpkg-shlibdeps` (Debian/Ubuntu host); without it the package still builds with an empty `Depends:` line, which is fine for the static musl binary.
+
+The package installs:
+
+| Path | Content |
+|------|---------|
+| `/usr/local/bin/bpfagent` | The agent binary |
+| `/etc/bpfagent.conf` | Config file (marked as conffile, preserved on upgrades) |
+| `/etc/systemd/system/bpfagent.service` | systemd unit |
+| `/usr/share/doc/bpfagent/` | README and copyright |
+
+After installing on the target:
+
+```bash
+sudo dpkg -i bpfagent_<version>-1_arm64.deb
+sudo systemctl daemon-reload
+sudo systemctl enable --now bpfagent
+```
+
 ## How It Works
 
 1. The eBPF program (e.g., `kfree_skb`) attaches to a kernel tracepoint
