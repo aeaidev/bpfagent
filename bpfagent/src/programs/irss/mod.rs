@@ -206,7 +206,7 @@ impl EbpfProgram for IrssProgram {
         )
         .map_err(|e| anyhow::anyhow!("failed to open RAW_DEST_MAP map: {}", e))?;
         raw_dest_map
-            .insert(RAW_DEST_KEY, u32::from_ne_bytes(self.raw_dest), 0)
+            .insert(&RAW_DEST_KEY, &u32::from_ne_bytes(self.raw_dest), 0)
             .map_err(|e| anyhow::anyhow!("failed to configure RAW_DEST_MAP: {}", e))?;
 
         let mut listen_port_map = HashMap::<_, u32, u32>::try_from(
@@ -215,7 +215,7 @@ impl EbpfProgram for IrssProgram {
         )
         .map_err(|e| anyhow::anyhow!("failed to open LISTEN_PORT_MAP map: {}", e))?;
         listen_port_map
-            .insert(LISTEN_PORT_KEY, self.listen_port as u32, 0)
+            .insert(&LISTEN_PORT_KEY, &(self.listen_port as u32), 0)
             .map_err(|e| anyhow::anyhow!("failed to configure LISTEN_PORT_MAP: {}", e))?;
         debug!(
             "IRSS filters: RX listen port {}, TX raw-IP destination {}",
