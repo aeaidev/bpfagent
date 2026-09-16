@@ -1,0 +1,17 @@
+[package]
+name = "uprobe-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+uprobe-common = { path = "../../common/uprobe" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "uprobe"
+path = "src/main.rs"

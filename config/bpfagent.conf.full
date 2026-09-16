@@ -42,6 +42,26 @@ listen_port = 5020
 # sendmsg() calls addressed here
 raw_dest = "10.10.10.253"
 
+[[ebpf_programs]]
+name = "uprobe"
+enabled = false
+# Traces calls to a function in a userspace binary/shared library and
+# snapshots its arguments (up to 6 register values, x86_64 SysV ABI)
+# Required program settings (no defaults; the program stays disabled
+# without target and symbol):
+[ebpf_programs.settings]
+# Path of the binary or shared library to instrument
+target = "/path/to/app"
+# Function symbol to trace (ELF symbol; stripped binaries need offset instead)
+symbol = "function_name"
+# Extra byte offset past the symbol (optional, default 0)
+offset = 0
+# PID filter: -1 = all processes, or a specific PID (optional, default -1)
+pid = -1
+# Argument to also read as a C string: 0 = none, 1-6 = argument index
+# (optional, default 0)
+string_arg = 0
+
 
 # Usage Notes
 # ===========

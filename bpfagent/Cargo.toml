@@ -29,6 +29,7 @@ prometheus = { workspace = true, default-features = false, features = ["process"
 irss-common = { path = "../common/irss" }
 kfree_skb-common = { path = "../common/kfree_skb" }
 sca-common = { path = "../common/sca", features = ["user"] }
+uprobe-common = { path = "../common/uprobe", features = ["user"] }
 procfs = { version = "0.15", default-features = false }
 
 [dev-dependencies]

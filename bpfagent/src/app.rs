@@ -26,6 +26,7 @@ fn register_programs() -> ProgramRegistry {
     crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::sca::init(&mut registry);
+    crate::programs::uprobe::init(&mut registry);
 
     registry
 }

@@ -5,6 +5,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - **kfree_skb** - traces kernel packet drops
 - **SCA** - traces socket communication latency per process
 - **IRSS** - measures UDP-to-raw-IP forwarding latency
+- **uprobe** - traces userspace function calls and their arguments
 
 ## Quick Links
 
@@ -51,6 +52,16 @@ The IRSS program measures how long the IRSS component holds one datagram, from t
 3. Userspace turns the cumulative accumulators into a periodic moving average (per-interval average) exported via Prometheus
 
 Both filters are configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`); unlike SCA, no PID/FD discovery (`ss`/`lsof`) is needed.
+
+### uprobe Program
+
+The uprobe program attaches a uprobe to a function in a userspace binary or shared library, counts calls per process, and snapshots the function's arguments — see [uprobe: Userspace Function Call Tracing](docs/UPROBE.md):
+
+1. On function entry: updates the calling process's record in the CALLS map (cumulative count, timestamp, up to 6 argument registers of the x86_64 SysV ABI, comm)
+2. Optionally reads one argument as a C string (`string_arg` setting)
+3. Userspace turns the cumulative per-pid counts into a Prometheus counter (`uprobe_calls_total{pname}`)
+
+The attach target is runtime-configurable via `[ebpf_programs.settings]` (`target`, `symbol`, `offset`, `pid`, `string_arg`); `target` and `symbol` are required — without them the program stays disabled.
 
 ## Quick Start
 
@@ -149,6 +160,11 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - On raw-IP send to the configured destination (default 10.10.10.253): matches the key, removes it, accumulates latency
   - Filters configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`), no PID/FD discovery needed
   - Exports a per-interval moving average via Prometheus
+- **uprobe program** - traces userspace function calls and their arguments
+  - Attaches a uprobe to a function symbol in a binary or shared library
+  - Counts calls per process; snapshots up to 6 argument registers of the most recent call
+  - Optional C-string read of one argument; attach configured via `[ebpf_programs.settings]` (`target`, `symbol`, `offset`, `pid`, `string_arg`)
+  - Exports the `uprobe_calls_total{pname}` counter via Prometheus
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
 - **Clean code organization** - separates concerns into modules (common, config, programs, metrics)
@@ -361,6 +377,12 @@ scrape_configs:
 |--------|------|--------|-------------|
 | `irss_avg_latency_us` | Gauge | | Average UDP-to-raw-IP forwarding latency in microseconds (per-interval moving average; 0 when no traffic) |
 
+#### uprobe Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `uprobe_calls_total` | Counter | `pname` | Total number of calls to the traced function per calling process (`pname` = "comm (PID n)") |
+
 ### Metrics Output Example
 
 #### kfree_skb
@@ -397,6 +419,14 @@ The IRSS program averages the per-datagram forwarding latency over each display 
  irss_avg_latency_us 12167
 ```
 
+#### uprobe
+
+```
+# HELP uprobe_calls_total Total number of calls to the traced function
+# TYPE uprobe_calls_total counter
+ uprobe_calls_total{pname="uprobe_sim (PID 42123)"} 57
+```
+
 ## Output Example
 
 ### kfree_skb Output
@@ -425,6 +455,15 @@ The IRSS program reports the average forwarding latency over each display interv
 
 ```
 IRSS forwarding latency: 12167 us (3 samples, UDP:5020 -> raw IP 10.10.10.253)
+```
+
+### uprobe Output
+
+The uprobe program reports per-process call counts and the most recent call's arguments (see [uprobe](docs/UPROBE.md)):
+
+```
+--- uprobe calls to uprobe_sim_target (target/debug/examples/uprobe_sim) ---
+  uprobe_sim (PID 42123): 57 calls (+6), last args: [0x38, 0xdeadbeef, 0x7f...], str="hello from uprobe_sim"
 ```
 
 ## Mapping Drop Reasons
@@ -456,18 +495,22 @@ bpfagent/
 │   │   └── programs/   # Program registry, traits, and eBPF program modules
 │   │       ├── irss/       # IRSS-specific logic (metrics, display)
 │   │       ├── kfree_skb/  # kfree_skb-specific logic (metrics, display)
-│   │       └── sca/        # SCA-specific logic (metrics, display, hop discovery)
+│   │       ├── sca/        # SCA-specific logic (metrics, display, hop discovery)
+│   │       └── uprobe/     # uprobe-specific logic (metrics, display, attach config)
 │   └── examples/
 │       ├── irss_sim.rs # IRSS data-flow simulator for end-to-end testing
-│       └── sca_sim.rs  # SCA pipeline simulator for end-to-end testing
+│       ├── sca_sim.rs  # SCA pipeline simulator for end-to-end testing
+│       └── uprobe_sim.rs # uprobe test target for end-to-end testing
 ├── common/
 │   ├── irss/           # Shared types between user and eBPF code
 │   ├── kfree_skb/      # Shared types between user and eBPF code
-│   └── sca/            # Shared types between user and eBPF code
+│   ├── sca/            # Shared types between user and eBPF code
+│   └── uprobe/         # Shared types between user and eBPF code
 └── ebpf/
     ├── irss/           # Kernel-space eBPF program source
     ├── kfree_skb/      # Kernel-space eBPF program source
-    └── sca/            # Kernel-space eBPF program source
+    ├── sca/            # Kernel-space eBPF program source
+    └── uprobe/         # Kernel-space eBPF program source
 ```
 
 ### Key Files
@@ -491,6 +534,13 @@ bpfagent/
 - `ebpf/irss/src/main.rs` - eBPF program that matches payload-tag timestamps for UDP-to-raw-IP latency calculation
 - `common/irss/src/lib.rs` - Common types (tracepoints, tag size, raw-IP destination)
 - `bpfagent/examples/irss_sim.rs` - IRSS data-flow simulator for end-to-end testing
+
+#### uprobe
+
+- `bpfagent/src/programs/uprobe/mod.rs` - uprobe-specific logic (metrics, display, attach settings)
+- `ebpf/uprobe/src/main.rs` - eBPF uprobe program (per-pid call counts + argument snapshot)
+- `common/uprobe/src/lib.rs` - Common types (`CallRecord`, argument/string constants)
+- `bpfagent/examples/uprobe_sim.rs` - uprobe test target for end-to-end testing
 
 **SCA Latency Calculation:**
 - Uses a combined key of hop index (4B) + Protocol (4B) to match REQ/REP message pairs

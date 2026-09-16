@@ -12,7 +12,7 @@ Linux, loads multiple eBPF programs into the kernel, periodically reads their
 BPF maps, and exposes the collected data as Prometheus metrics over HTTP
 (default `0.0.0.0:9101/metrics`).
 
-Three eBPF programs ship with the agent:
+Four eBPF programs ship with the agent:
 
 - **kfree_skb** — counts kernel packet drops by reason at the `skb:kfree_skb`
   tracepoint (kernel `enum skb_drop_reason`).
@@ -22,13 +22,17 @@ Three eBPF programs ship with the agent:
 - **irss** — measures UDP-to-raw-IP forwarding latency of the IRSS data flow
   (CRYPTO → IRSS → MAC); datagrams are keyed by their first 4 payload bytes,
   filters are runtime-configurable (`listen_port`, `raw_dest`).
+- **uprobe** — traces calls to a function in a userspace binary/shared
+  library and snapshots its arguments (up to 6 register values, x86_64 SysV
+  ABI); the attach target is runtime-configurable (`target`, `symbol`,
+  `offset`, `pid`, `string_arg`).
 
 License: MIT OR Apache-2.0. Rust edition 2021. All documentation and code
 comments are in English.
 
 ## Repository Layout
 
-Cargo workspace (root `Cargo.toml`) with 7 members. Each eBPF program follows a
+Cargo workspace (root `Cargo.toml`) with 9 members. Each eBPF program follows a
 strict three-crate pattern:
 
 ```
@@ -46,17 +50,19 @@ bpfagent/               # Userspace application (lib + thin `bpfagent` binary)
 │       ├── registry.rs     # ProgramRegistry (name -> factory closure)
 │       ├── irss/mod.rs     # IRSS userspace handler (metrics, display)
 │       ├── kfree_skb/mod.rs
-│       └── sca/mod.rs      # SCA handler (metrics, display, hop discovery)
+│       ├── sca/mod.rs      # SCA handler (metrics, display, hop discovery)
+│       └── uprobe/mod.rs   # uprobe handler (metrics, display, attach config)
 ├── examples/
 │   ├── irss_sim.rs     # IRSS data-flow simulator for end-to-end testing
-│   └── sca_sim.rs      # SCA pipeline simulator (6 processes, 7 hops)
+│   ├── sca_sim.rs      # SCA pipeline simulator (6 processes, 7 hops)
+│   └── uprobe_sim.rs   # uprobe test target (calls a known function in a loop)
 ├── tests/              # Integration tests (no root required)
 ├── build.rs            # Compiles all eBPF crates via aya-build (see below)
 └── Cargo.toml          # Also holds [package.metadata.deb] for cargo-deb
 
 common/<name>/          # Shared types between kernel and userspace
-                        # (irss, kfree_skb, sca; no_std-compatible, optional
-                        #  `user` feature pulls in aya for userspace)
+                        # (irss, kfree_skb, sca, uprobe; no_std-compatible,
+                        #  optional `user` feature pulls in aya for userspace)
 ebpf/<name>/            # eBPF kernel program source (#![no_std] #![no_main],
                         # compiled to bpfel-unknown-none)
 
@@ -76,8 +82,8 @@ the `ebpf/*` crates are workspace members but are built for the BPF target by
 
 ## Build System Details
 
-- `bpfagent/build.rs` discovers the `irss-ebpf`, `kfree_skb-ebpf`, and
-  `sca-ebpf` packages from workspace metadata and compiles them with
+- `bpfagent/build.rs` discovers the `irss-ebpf`, `kfree_skb-ebpf`, `sca-ebpf`,
+  and `uprobe-ebpf` packages from workspace metadata and compiles them with
   `aya-build` (nightly toolchain + `bpf-linker` to `bpfel-unknown-none`). The
   objects land in `OUT_DIR` under their `[[bin]]` names and are embedded into
   the userspace binary with `aya::include_bytes_aligned!`.
@@ -156,6 +162,8 @@ cargo test --doc         # doc tests
 cargo run -p bpfagent --example sca_sim    # start BEFORE the agent: SCA hop
                                            # discovery happens once at load
 cargo run -p bpfagent --example irss_sim
+cargo run -p bpfagent --example uprobe_sim # prints the path/PID to point the
+                                           # uprobe settings at
 sudo ./target/debug/bpfagent               # in another terminal
 ```
 
@@ -260,5 +268,6 @@ Reference: `config/bpfagent.conf.full`.
 - `docs/DEVELOPMENT.md` — build/test/debug workflows
 - `docs/PLUGINS.md` / `docs/PLUGINS_C.md` — plugin development (Rust / C)
 - `docs/IRSS.md`, `docs/SCA_DATA_FLOW.md` — per-program data flows
+- `docs/UPROBE.md` — uprobe settings, symbol requirements, sim walkthrough
 - `docs/bpfagent.1` — man page (`man -l docs/bpfagent.1`)
 - `CHANGELOG.md` — version history (Keep a Changelog)

@@ -21,3 +21,15 @@ enabled = true
 # [ebpf_programs.settings]
 # listen_port = 5020
 # raw_dest = "10.10.10.253"
+
+[[ebpf_programs]]
+name = "uprobe"
+enabled = false
+# Traces calls + arguments of a userspace function; target and symbol are
+# required to actually enable it (no defaults exist)
+# [ebpf_programs.settings]
+# target = "/path/to/app"   # binary or shared library to instrument
+# symbol = "function_name"  # function to trace (ELF symbol)
+# offset = 0                # extra byte offset past the symbol
+# pid = -1                  # -1 = all processes, or a specific PID
+# string_arg = 0            # 1-6: also read this argument as a C string

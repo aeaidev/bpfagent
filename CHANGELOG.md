@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved from an unfiltered `sys_enter_recvmsg` tracepoint to a kprobe on
   `udp_recvmsg` that checks the socket's local port (`LISTEN_PORT_MAP`), so
   unrelated receive traffic is filtered out too
+- uprobe eBPF program: traces calls to a function in a userspace
+  binary/shared library and snapshots its arguments (up to 6 register
+  values, x86_64 SysV ABI). The attach target is runtime-configurable via
+  `[ebpf_programs.settings]` (`target`, `symbol`, `offset`, `pid`,
+  `string_arg`); per-process call counts are exported as the
+  `uprobe_calls_total{pname}` counter
+- uprobe simulator example (`bpfagent/examples/uprobe_sim.rs`) for
+  end-to-end testing
 
 ### Changed
 - Improved code organization with logical modules
