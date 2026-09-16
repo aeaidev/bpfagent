@@ -46,7 +46,12 @@
 //!
 //! - `sca_avg_latency_per_pname`: Moving average latency in microseconds per process name
 
-use std::{any::Any, collections::HashSet, sync::Arc, time::{Duration, Instant}};
+use std::{
+    any::Any,
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use log::{debug, error, info, warn};
@@ -64,8 +69,8 @@ use sca_common;
 /// Since both define it as #[repr(C)] with the same u32 fields, they are binary compatible
 pub use sca_common::HopEndpoint;
 
-pub use helpers::{UnixSockRec, parse_ss_unix_stream, parse_ss_users, paths_by_inode};
 use helpers::{get_pid_by_process_name, query_established_unix_sockets};
+pub use helpers::{parse_ss_unix_stream, parse_ss_users, paths_by_inode, UnixSockRec};
 
 /// Minimum interval between endpoint-rediscovery attempts while no fresh
 /// latency samples arrive (the likely sign of restarted processes).
@@ -162,7 +167,11 @@ impl EbpfProgram for ScaProgram {
         // Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries
         // discovered from running processes. Also populates socket_path_map
         // and socket_pid_map for metrics display.
-        populate_socket_hops_map(&mut self.socket_path_map, &mut self.socket_pid_map, &mut ebpf)?;
+        populate_socket_hops_map(
+            &mut self.socket_path_map,
+            &mut self.socket_pid_map,
+            &mut ebpf,
+        )?;
 
         debug!("SOCKET_HOPS_MAP populated, now attaching tracepoints...");
 
@@ -256,7 +265,7 @@ impl MetricsDisplay for ScaProgram {
             // same endpoints and changes nothing.
             if self
                 .last_repopulation
-                .map_or(true, |t| t.elapsed() >= REPOPULATION_INTERVAL)
+                .is_none_or(|t| t.elapsed() >= REPOPULATION_INTERVAL)
             {
                 self.last_repopulation = Some(Instant::now());
                 if let Err(e) = repopulate_socket_hops_map(
@@ -522,10 +531,9 @@ fn populate_socket_hops_map(
         .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
 
     for (hop_index, (path, sending, receiving)) in sca_common::DATA_FLOW.iter().enumerate() {
-        let (Some(&s_pid), Some(&r_pid)) = (
-            process_pid_map.get(sending),
-            process_pid_map.get(receiving),
-        ) else {
+        let (Some(&s_pid), Some(&r_pid)) =
+            (process_pid_map.get(sending), process_pid_map.get(receiving))
+        else {
             warn!(
                 "Skipping hop {} ({}): {} or {} not running",
                 hop_index, path, sending, receiving

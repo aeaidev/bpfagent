@@ -50,6 +50,9 @@
 
 use std::{any::Any, net::Ipv4Addr, sync::Arc};
 
+/// Microseconds per nanosecond conversion factor
+const NS_PER_US: u64 = 1_000;
+
 use aya::{
     maps::HashMap,
     programs::{KProbe, TracePoint},
@@ -295,12 +298,22 @@ pub fn latency_deltas(
 
 /// Average latency in microseconds for one display tick, or None when no
 /// datagrams were matched since the previous tick.
+///
+/// # Examples
+///
+/// ```
+/// use bpfagent::programs::irss::avg_latency_us;
+///
+/// // With 1000 samples, each 1000000 ns (1ms) apart
+/// let latency = avg_latency_us(1000000000, 1000);
+/// assert_eq!(latency, Some(1000)); // 1000000000 / 1000 / 1000 = 1000 us
+///
+/// // No samples means no latency
+/// let latency = avg_latency_us(0, 0);
+/// assert_eq!(latency, None);
+/// ```
 pub fn avg_latency_us(sum_delta: u64, count_delta: u64) -> Option<u64> {
-    if count_delta == 0 {
-        None
-    } else {
-        Some(sum_delta / count_delta / 1_000)
-    }
+    sum_delta.checked_div(count_delta)?.checked_div(NS_PER_US)
 }
 
 impl MetricsDisplay for IrssProgram {
@@ -379,4 +392,51 @@ impl EbpfAccess for IrssProgram {
 /// Initialize this program by registering it with the registry
 pub fn init(registry: &mut ProgramRegistry) {
     registry.register("irss", || Box::new(IrssProgram::new()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_avg_latency_us() {
+        // Normal case: valid sum and count
+        assert_eq!(avg_latency_us(1_000_000_000, 1000), Some(1000));
+        // No samples - division by zero handled
+        assert_eq!(avg_latency_us(0, 0), None);
+        // Very small latency
+        assert_eq!(avg_latency_us(500_000, 100), Some(5));
+        // Exact division
+        assert_eq!(avg_latency_us(2_000_000, 2), Some(1000));
+    }
+
+    #[test]
+    fn test_latency_deltas() {
+        let mut last_sum = 0u64;
+        let mut last_count = 0u64;
+
+        // First read: should be the full values
+        let (sum_delta, count_delta) = latency_deltas(&mut last_sum, &mut last_count, 1000, 10);
+        assert_eq!(sum_delta, 1000);
+        assert_eq!(count_delta, 10);
+
+        // Second read with new values
+        let (sum_delta, count_delta) = latency_deltas(&mut last_sum, &mut last_count, 2500, 25);
+        assert_eq!(sum_delta, 1500);
+        assert_eq!(count_delta, 15);
+
+        // Value went backwards (e.g., map reset) - should return 0
+        let (sum_delta, count_delta) = latency_deltas(&mut last_sum, &mut last_count, 500, 5);
+        assert_eq!(sum_delta, 0);
+        assert_eq!(count_delta, 0);
+    }
+
+    #[test]
+    fn test_avg_latency_us_overflow() {
+        // Large sum that would overflow if we didn't use checked_div
+        let large_sum = u64::MAX;
+        let count = 1000;
+        // This should not panic
+        let _ = avg_latency_us(large_sum, count);
+    }
 }

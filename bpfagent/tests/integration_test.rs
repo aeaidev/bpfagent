@@ -44,13 +44,16 @@ mod tests {
     #[test]
     fn test_scripts_exist_and_executable() {
         // Verify that development scripts are present and executable
-        for script in &["setup.sh", "build.sh", "test.sh", "lint.sh", "format.sh", "release.sh"] {
+        for script in &[
+            "setup.sh",
+            "build.sh",
+            "test.sh",
+            "lint.sh",
+            "format.sh",
+            "release.sh",
+        ] {
             let path = format!("../scripts/{}", script);
-            assert!(
-                Path::new(&path).exists(),
-                "Script {} should exist",
-                script
-            );
+            assert!(Path::new(&path).exists(), "Script {} should exist", script);
         }
     }
 

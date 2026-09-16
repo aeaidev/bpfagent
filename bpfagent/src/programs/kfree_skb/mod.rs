@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use aya::{maps::HashMap, programs::TracePoint, Ebpf};
 use kfree_skb_common::{reason_name, SkbDropReason};
 use log::{debug, info, trace};
@@ -61,13 +62,11 @@ impl KfreeSkbMetrics {
             ),
             &["reason"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create total_drops_per_sec gauge: {}", e))?;
+        .context("failed to create total_drops_per_sec gauge")?;
 
         registry
             .register(Box::new(total_drops_per_sec.clone()))
-            .map_err(|e| {
-                anyhow::anyhow!("failed to register total_drops_per_sec gauge: {}", e)
-            })?;
+            .context("failed to register total_drops_per_sec gauge")?;
 
         let drops_per_sec = GaugeVec::new(
             Opts::new(
@@ -76,11 +75,11 @@ impl KfreeSkbMetrics {
             ),
             &["reason_code", "reason_name"],
         )
-        .map_err(|e| anyhow::anyhow!("failed to create drops_per_sec gauge: {}", e))?;
+        .context("failed to create drops_per_sec gauge")?;
 
         registry
             .register(Box::new(drops_per_sec.clone()))
-            .map_err(|e| anyhow::anyhow!("failed to register drops_per_sec gauge: {}", e))?;
+            .context("failed to register drops_per_sec gauge")?;
 
         Ok(Self {
             total_drops_per_sec,
@@ -142,7 +141,7 @@ impl EbpfProgram for KfreeSkbProgram {
             .ok_or_else(|| anyhow::anyhow!("program 'kfree_skb' not found"))
             .and_then(|p| {
                 p.try_into()
-                    .map_err(|e| anyhow::anyhow!("failed to convert to TracePoint: {}", e))
+                    .map_err(|e| anyhow::anyhow!("failed to convert to TracePoint: {e}"))
             })?;
         program.load()?;
         program.attach("skb", "kfree_skb")?;
@@ -220,8 +219,8 @@ impl MetricsDisplay for KfreeSkbProgram {
         let map = ebpf
             .map_mut("DROP_COUNTS")
             .ok_or_else(|| anyhow::anyhow!("DROP_COUNTS map not found"))?;
-        let drop_counts = HashMap::<_, u32, u64>::try_from(map)
-            .map_err(|_| anyhow::anyhow!("failed to get DROP_COUNTS map"))?;
+        let drop_counts =
+            HashMap::<_, u32, u64>::try_from(map).context("failed to get DROP_COUNTS map")?;
 
         // Collect all entries from the map
         let mut all_counts = Vec::new();
@@ -246,9 +245,10 @@ impl MetricsDisplay for KfreeSkbProgram {
                 // No drops within the window: the rate decayed to zero, drop
                 // the series and skip the reason in the output.
                 self.delta_windows.remove(&reason);
-                let label = [reason.to_string(), name.to_string()];
-                let label_refs: Vec<&str> = label.iter().map(String::as_str).collect();
-                if let Err(e) = metrics.drops_per_sec.remove_label_values(&label_refs) {
+                if let Err(e) = metrics
+                    .drops_per_sec
+                    .remove_label_values(&[&reason.to_string(), name])
+                {
                     debug!("failed to remove decayed drop-rate series {}: {}", name, e);
                 }
                 continue;
@@ -256,7 +256,7 @@ impl MetricsDisplay for KfreeSkbProgram {
             let rate = sum as f64 / RATE_WINDOW.as_secs_f64();
             metrics
                 .drops_per_sec
-                .with_label_values(&[&reason.to_string(), &name.to_string()])
+                .with_label_values(&[&reason.to_string(), name])
                 .set(rate);
             rows.push((reason, name, rate));
         }

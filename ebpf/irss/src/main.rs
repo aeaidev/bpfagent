@@ -232,7 +232,7 @@ fn accumulate_latency(latency: u64) {
     let _ = LATENCY_COUNT.insert(&ACCUM_KEY, &(count + 1), 0);
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "bpf"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

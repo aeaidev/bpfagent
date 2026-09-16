@@ -33,6 +33,7 @@ procfs = { version = "0.15", default-features = false }
 
 [dev-dependencies]
 rand = "0.9"
+serial_test = { version = "3" }
 
 [build-dependencies]
 aya-build = { workspace = true }

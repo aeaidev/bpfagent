@@ -1,2 +1,6 @@
 [target."cfg(all())"]
 runner = "sudo -E"
+
+# Configure eBPF crates to build for the BPF target
+[target.bpfel-unknown-none]
+linker = "bpf-linker"

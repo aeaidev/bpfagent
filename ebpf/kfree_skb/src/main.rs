@@ -1,9 +1,7 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![no_std]
 #![no_main]
-/**
- * Copyright (c) 2026 Katim LLC
- * All rights reserved.
- */
+
 use aya_ebpf::{
     macros::{map, tracepoint},
     maps::HashMap,
@@ -62,8 +60,12 @@ unsafe fn try_kfree_skb(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "bpf"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
