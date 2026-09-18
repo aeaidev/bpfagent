@@ -23,6 +23,19 @@
 //!   the same message (LATENCY_HOP_MAP) is subtracted: the reported latency
 //!   is each hop's individual contribution.
 //!
+//! # Containers and PID Namespaces
+//!
+//! The eBPF program keys its maps by the PID reported by
+//! bpf_get_current_pid_tgid(), which is always in the host (initial) PID
+//! namespace. Discovery therefore never resolves PIDs by process name (a
+//! /proc scan sees every simulator instance when containers share the host
+//! /proc and can pick the wrong one); it matches sockets by hop path only.
+//! `ss -xpH` runs in the agent's own network namespace, so each agent sees
+//! exactly its own container's sockets; the owner name of each socket is
+//! validated via /proc/<pid>/comm, and every PID is translated to the host
+//! namespace via the NSpid field of /proc/<pid>/status before it is used as
+//! a map key.
+//!
 //! # Moving Average
 //!
 //! Latencies are tracked using a sliding window moving average:
@@ -69,8 +82,8 @@ use sca_common;
 /// Since both define it as #[repr(C)] with the same u32 fields, they are binary compatible
 pub use sca_common::HopEndpoint;
 
-use helpers::{get_pid_by_process_name, query_established_unix_sockets};
-pub use helpers::{parse_ss_unix_stream, parse_ss_users, paths_by_inode, UnixSockRec};
+use helpers::{comm_matches, query_established_unix_sockets, to_host_pid};
+pub use helpers::{parse_nspid, parse_ss_unix_stream, parse_ss_users, paths_by_inode, UnixSockRec};
 
 /// Minimum interval between endpoint-rediscovery attempts while no fresh
 /// latency samples arrive (the likely sign of restarted processes).
@@ -428,88 +441,155 @@ fn report_pid_latency(
         .set(avg_latency_us as i64);
 }
 
-/// Resolve the PIDs of all processes named in DATA_FLOW by scanning /proc.
-fn collect_data_flow_pids() -> std::collections::HashMap<&'static str, u32> {
-    let mut pids = std::collections::HashMap::new();
-    for &(_socket_path, sending, receiving) in sca_common::DATA_FLOW {
-        for process_name in [sending, receiving] {
-            if let std::collections::hash_map::Entry::Vacant(entry) = pids.entry(process_name) {
-                if let Some(pid) = get_pid_by_process_name(process_name) {
-                    entry.insert(pid);
-                    info!("Found PID {} for process {}", pid, process_name);
-                }
-            }
-        }
-    }
-    pids
-}
-
-/// Decide whether `sock` is an endpoint of the hop between `s_pid` and `r_pid`
-/// on `path`, and if so, with which role.
+/// Decide whether `sock` is an endpoint of the hop on `path`, and if so,
+/// with which role.
 ///
 /// Returns Some(1) for the sender endpoint and Some(0) for the receiver:
 /// the receiver's accepted socket carries the hop path directly, while the
 /// sender's connected socket has no path of its own and is resolved via its
-/// peer inode (the receiver's accepted socket).
+/// peer inode (the receiver's accepted socket). Matching is by socket path
+/// only; the owning process is validated against DATA_FLOW by the caller.
 pub fn endpoint_role(
     sock: &UnixSockRec,
-    s_pid: u32,
-    r_pid: u32,
     path: &str,
     path_by_inode: &std::collections::HashMap<u64, &str>,
 ) -> Option<u32> {
-    if sock.pid == r_pid && sock.path.as_deref() == Some(path) {
+    if sock.path.as_deref() == Some(path) {
         Some(0)
-    } else if sock.pid == s_pid
-        && sock.path.is_none()
-        && path_by_inode.get(&sock.peer_inode) == Some(&path)
-    {
+    } else if sock.path.is_none() && path_by_inode.get(&sock.peer_inode) == Some(&path) {
         Some(1)
     } else {
         None
     }
 }
 
-/// Insert one (pid, fd) -> HopEndpoint entry into SOCKET_HOPS_MAP.
-/// Returns true on success.
+/// One discovered hop endpoint socket, ready for SOCKET_HOPS_MAP insertion.
+struct DiscoveredHop {
+    /// Index into DATA_FLOW identifying the hop
+    hop_index: usize,
+    /// PID in the host (initial) PID namespace — what the eBPF program sees
+    /// via bpf_get_current_pid_tgid()
+    host_pid: u32,
+    fd: u32,
+    is_sender: u32,
+    path: &'static str,
+    pname: &'static str,
+}
+
+/// Discover hop endpoints from `ss -xpH` output.
+///
+/// Matching is socket-driven: the receiver's accepted socket carries the hop
+/// path and the sender's connected socket is resolved via its peer inode
+/// (see endpoint_role). No PID is resolved by process name, so discovery is
+/// unaffected by running inside a container: `ss` only shows sockets of our
+/// own network namespace (several simulator instances in different
+/// containers sharing the host /proc are never confused), the owner of each
+/// socket is validated against the expected process name via
+/// /proc/<pid>/comm, and the PID is translated to the host PID namespace
+/// (what the eBPF program keys by) via /proc/<pid>/status NSpid.
+fn discover_hop_sockets() -> anyhow::Result<Vec<DiscoveredHop>> {
+    let sockets = query_established_unix_sockets()?;
+    let path_by_inode = paths_by_inode(&sockets);
+
+    let mut hops = Vec::new();
+    for (hop_index, &(path, sending, receiving)) in sca_common::DATA_FLOW.iter().enumerate() {
+        let mut found = false;
+        for sock in &sockets {
+            let Some(role) = endpoint_role(sock, path, &path_by_inode) else {
+                continue;
+            };
+            let pname = if role == 1 { sending } else { receiving };
+            if !comm_matches(sock.pid, pname) {
+                continue;
+            }
+            found = true;
+            hops.push(DiscoveredHop {
+                hop_index,
+                host_pid: to_host_pid(sock.pid),
+                fd: sock.fd,
+                is_sender: role,
+                path,
+                pname,
+            });
+        }
+        if !found {
+            warn!(
+                "No endpoints found for hop {} ({}): {} -> {} sockets not visible",
+                hop_index, path, sending, receiving
+            );
+        }
+    }
+    Ok(hops)
+}
+
+/// Insert one discovered endpoint as a (pid, fd) -> HopEndpoint entry into
+/// SOCKET_HOPS_MAP.
 fn insert_endpoint(
     hops_map: &mut HashMap<&mut aya::maps::MapData, u64, HopEndpoint>,
-    hop_index: u32,
-    sock: &UnixSockRec,
-    is_sender: u32,
-    path: &str,
-) -> bool {
-    let key = ((sock.pid as u64) << 32) | (sock.fd as u64);
+    hop: &DiscoveredHop,
+) {
+    let key = ((hop.host_pid as u64) << 32) | (hop.fd as u64);
     let mut path_bytes = [0u8; 32];
-    let n = path.len().min(32);
-    path_bytes[..n].copy_from_slice(&path.as_bytes()[..n]);
+    let n = hop.path.len().min(32);
+    path_bytes[..n].copy_from_slice(&hop.path.as_bytes()[..n]);
     let endpoint = HopEndpoint {
-        hop_index,
-        is_sender,
+        hop_index: hop.hop_index as u32,
+        is_sender: hop.is_sender,
         path: path_bytes,
     };
     match hops_map.insert(&key, &endpoint, 0) {
         Ok(()) => {
             info!(
                 "Added hop {} endpoint: pid={}, fd={}, is_sender={}, path={}",
-                hop_index, sock.pid, sock.fd, is_sender, path
+                hop.hop_index, hop.host_pid, hop.fd, hop.is_sender, hop.path
             );
-            true
         }
         Err(e) => {
             error!(
                 "Failed to insert hop {} endpoint (pid={}, fd={}): {}",
-                hop_index, sock.pid, sock.fd, e
+                hop.hop_index, hop.host_pid, hop.fd, e
             );
-            false
         }
     }
+}
+
+/// Insert discovered endpoints into SOCKET_HOPS_MAP and rebuild the display
+/// maps (PID -> process name, receiver PID -> hop path(s)).
+fn insert_discovered(
+    socket_path_map: &mut std::collections::HashMap<u32, String>,
+    socket_pid_map: &mut std::collections::HashMap<u32, String>,
+    ebpf: &mut Ebpf,
+    hops: &[DiscoveredHop],
+) -> anyhow::Result<()> {
+    let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
+        return Err(anyhow::anyhow!("SOCKET_HOPS_MAP not found"));
+    };
+    let mut hops_map: HashMap<_, u64, HopEndpoint> = map
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
+
+    for hop in hops {
+        socket_pid_map.insert(hop.host_pid, hop.pname.to_string());
+        if hop.is_sender == 0 {
+            socket_path_map
+                .entry(hop.host_pid)
+                .and_modify(|p| {
+                    if !p.is_empty() {
+                        p.push_str(", ");
+                    }
+                    p.push_str(hop.path);
+                })
+                .or_insert_with(|| hop.path.to_string());
+        }
+        insert_endpoint(&mut hops_map, hop);
+    }
+    Ok(())
 }
 
 /**
  * Populate SOCKET_HOPS_MAP with (pid, fd) -> HopEndpoint entries.
  *
- * Discovery uses `ss -xp` peer-inode pairing (see endpoint_role).
+ * Discovery uses `ss -xp` peer-inode pairing (see discover_hop_sockets).
  * Also populates socket_path_map and socket_pid_map for metrics display.
  */
 fn populate_socket_hops_map(
@@ -518,55 +598,8 @@ fn populate_socket_hops_map(
     ebpf: &mut Ebpf,
 ) -> anyhow::Result<()> {
     debug!("Populating SOCKET_HOPS_MAP from running processes via ss");
-
-    let process_pid_map = collect_data_flow_pids();
-    let sockets = query_established_unix_sockets()?;
-    let path_by_inode = paths_by_inode(&sockets);
-
-    let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
-        return Err(anyhow::anyhow!("SOCKET_HOPS_MAP not found"));
-    };
-    let mut hops_map: HashMap<_, u64, HopEndpoint> = map
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Failed to get SOCKET_HOPS_MAP"))?;
-
-    for (hop_index, (path, sending, receiving)) in sca_common::DATA_FLOW.iter().enumerate() {
-        let (Some(&s_pid), Some(&r_pid)) =
-            (process_pid_map.get(sending), process_pid_map.get(receiving))
-        else {
-            warn!(
-                "Skipping hop {} ({}): {} or {} not running",
-                hop_index, path, sending, receiving
-            );
-            continue;
-        };
-
-        socket_pid_map.insert(s_pid, sending.to_string());
-        socket_pid_map.insert(r_pid, receiving.to_string());
-        socket_path_map
-            .entry(r_pid)
-            .and_modify(|p| {
-                if !p.is_empty() {
-                    p.push_str(", ");
-                }
-                p.push_str(path);
-            })
-            .or_insert_with(|| path.to_string());
-
-        let mut found = false;
-        for sock in &sockets {
-            if let Some(role) = endpoint_role(sock, s_pid, r_pid, path, &path_by_inode) {
-                found |= insert_endpoint(&mut hops_map, hop_index as u32, sock, role, path);
-            }
-        }
-        if !found {
-            warn!(
-                "No endpoints found for hop {} ({}): sockets of {} (pid {}) / {} (pid {}) not visible",
-                hop_index, path, sending, s_pid, receiving, r_pid
-            );
-        }
-    }
-    Ok(())
+    let hops = discover_hop_sockets()?;
+    insert_discovered(socket_path_map, socket_pid_map, ebpf, &hops)
 }
 
 /**
@@ -576,14 +609,15 @@ fn populate_socket_hops_map(
  * for exactly one sender and one receiver fd per hop, and the per-PID
  * latency maps (16 entries each) would otherwise fill up with dead PIDs
  * across restarts, silently dropping new samples. The display maps are
- * then rebuilt from scratch by populate_socket_hops_map.
+ * then rebuilt from scratch and SOCKET_HOPS_MAP is repopulated.
  */
 fn repopulate_socket_hops_map(
     socket_path_map: &mut std::collections::HashMap<u32, String>,
     socket_pid_map: &mut std::collections::HashMap<u32, String>,
     ebpf: &mut Ebpf,
 ) -> anyhow::Result<()> {
-    let live_pids: HashSet<u32> = collect_data_flow_pids().into_values().collect();
+    let hops = discover_hop_sockets()?;
+    let live_pids: HashSet<u32> = hops.iter().map(|h| h.host_pid).collect();
 
     {
         let Some(map) = ebpf.map_mut("SOCKET_HOPS_MAP") else {
@@ -632,5 +666,5 @@ fn repopulate_socket_hops_map(
     socket_path_map.clear();
 
     info!("Latency updates stopped, re-running SCA endpoint discovery");
-    populate_socket_hops_map(socket_path_map, socket_pid_map, ebpf)
+    insert_discovered(socket_path_map, socket_pid_map, ebpf, &hops)
 }

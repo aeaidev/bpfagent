@@ -94,30 +94,49 @@ pub(super) fn query_established_unix_sockets() -> anyhow::Result<Vec<UnixSockRec
     )))
 }
 
-/// Get PID from process name by reading /proc/*/comm
-pub(super) fn get_pid_by_process_name(process_name: &str) -> Option<u32> {
-    for entry in std::fs::read_dir("/proc").ok()? {
-        // Skip unreadable entries instead of aborting the whole scan
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let dir_name = entry.file_name();
-        let pid_str = dir_name.to_string_lossy();
+/// Extract the host (initial namespace) PID from the content of
+/// /proc/<pid>/status. The `NSpid:` field lists the process's PID in every
+/// PID namespace from the host down to its own, so the first number is the
+/// PID the kernel reports to eBPF via bpf_get_current_pid_tgid().
+pub fn parse_nspid(status: &str) -> Option<u32> {
+    let line = status.lines().find(|l| l.starts_with("NSpid:"))?;
+    line.strip_prefix("NSpid:")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
 
-        // Skip non-numeric directories
-        if pid_str.parse::<u32>().is_err() {
-            continue;
-        }
+/// Translate a PID from the PID namespace of our /proc view to the host
+/// (initial) PID namespace, which is what the eBPF program keys its maps by.
+/// On the host, or in a container sharing the host PID namespace, this is
+/// the identity. A vanished process or a missing NSpid field (kernel without
+/// PID namespace support) falls back to the PID unchanged.
+pub fn to_host_pid(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| parse_nspid(&status))
+        .unwrap_or(pid)
+}
 
-        // Read comm file to get process name
-        let comm_path = entry.path().join("comm");
-        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-            // comm file contains process name with newline
-            let comm = comm.trim();
-            if comm == process_name {
-                return pid_str.parse::<u32>().ok();
+/// Validate that the process owning a discovered socket has the expected
+/// name. An unreadable comm (the process exited between the ss snapshot and
+/// this check) is accepted: the kernel-reported socket owner is authoritative
+/// and a stale entry is evicted on the next rediscovery.
+pub(super) fn comm_matches(pid: u32, expected: &str) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => {
+            let matches = comm.trim() == expected;
+            if !matches {
+                warn!(
+                    "socket owner pid {} is {:?}, expected {:?} — skipping endpoint",
+                    pid,
+                    comm.trim(),
+                    expected
+                );
             }
+            matches
         }
+        Err(_) => true,
     }
-    None
 }

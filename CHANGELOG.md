@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SCA moving-average output no longer repeats a PID's last average forever
   after traffic stops; PIDs with no new samples between display ticks are
   dropped from the log output and their Prometheus series are removed
+- SCA hop discovery now works inside Docker containers: matching is
+  socket-path driven (`ss -xpH` only shows our own network namespace, so
+  several simulator instances in containers sharing the host /proc are no
+  longer confused) and every discovered PID is translated to the host PID
+  namespace via the NSpid field of /proc/<pid>/status, which is what
+  bpf_get_current_pid_tgid() reports to the eBPF program
 
 ## [0.1.0] - 2026-08-07
 
