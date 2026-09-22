@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved from an unfiltered `sys_enter_recvmsg` tracepoint to a kprobe on
   `udp_recvmsg` that checks the socket's local port (`LISTEN_PORT_MAP`), so
   unrelated receive traffic is filtered out too
+- IFLAT eBPF program: measures interface-to-interface forwarding latency of
+  UDP datagrams (e.g. eno1 -> tun0) across nftables NAT. RX is an XDP program
+  on the ingress interface, TX a TC clsact egress classifier on the egress
+  interface; datagrams are correlated by the first 4 payload bytes, which NAT
+  does not rewrite, and the per-interval moving average is exported as the
+  `iflat_avg_latency_us` gauge. Interfaces are required settings
+  (`rx_iface`/`tx_iface`); without them the program stays disabled
+- IFLAT simulator example (`bpfagent/examples/iflat_sim.rs`): builds a
+  netns+veth+tun topology with nftables masquerade for end-to-end testing
+  and reports the userspace send-to-receive latency for comparison
+- Stats interval is now configurable via the daemon config key
+  `stats_interval_ms` (default 3000 ms); it drives BPF-map reads, the
+  interactive statistics print and Prometheus updates, so per-interval
+  averages/deltas (e.g. `iflat_avg_latency_us`, `irss_avg_latency_us`) cover
+  that window
 - uprobe eBPF program: traces calls to a function in a userspace
   binary/shared library and snapshots its arguments (up to 6 register
   values, x86_64 SysV ABI). The attach target is runtime-configurable via

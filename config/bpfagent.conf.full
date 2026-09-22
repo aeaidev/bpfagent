@@ -13,6 +13,11 @@ working_directory = "/"
 # Path to log file (used in daemon mode)
 log_file = "/var/log/bpfagent.log"
 
+# Interval (milliseconds) driving BPF-map reads, interactive statistics
+# printing and Prometheus updates; per-interval averages/deltas cover this
+# window (optional, default 3000, must be > 0)
+# stats_interval_ms = 3000
+
 
 # eBPF Programs
 # =============
@@ -41,6 +46,20 @@ listen_port = 5020
 # Raw-IP destination of the IRSS data flow (MAC); the TX filter only matches
 # sendmsg() calls addressed here
 raw_dest = "10.10.10.253"
+
+[[ebpf_programs]]
+name = "iflat"
+enabled = false
+# Measures interface-to-interface forwarding latency of UDP datagrams (e.g.
+# eno1 -> tun0) by correlating the first 4 payload bytes, which NAT does not
+# rewrite; RX is XDP on rx_iface, TX is a TC clsact egress classifier on
+# tx_iface. Required program settings (no defaults; the program stays
+# disabled without them):
+[ebpf_programs.settings]
+# Ingress interface (XDP hook, e.g. eno1)
+rx_iface = "eno1"
+# Egress interface (TC clsact egress hook, e.g. tun0)
+tx_iface = "tun0"
 
 [[ebpf_programs]]
 name = "uprobe"

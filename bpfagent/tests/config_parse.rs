@@ -106,3 +106,23 @@ log_file = "/l"
 fn invalid_toml_is_an_error() {
     assert!(toml::from_str::<DaemonConfig>("this is not [toml").is_err());
 }
+
+#[test]
+fn stats_interval_ms_defaults_to_3000() {
+    let cfg: DaemonConfig = toml::from_str(FULL_TOML).expect("full config should parse");
+    assert_eq!(cfg.stats_interval_ms, 3000);
+}
+
+#[test]
+fn stats_interval_ms_parses() {
+    let cfg: DaemonConfig = toml::from_str(
+        r#"
+pid_file = "/p"
+working_directory = "/"
+log_file = "/l"
+stats_interval_ms = 1000
+"#,
+    )
+    .expect("config should parse");
+    assert_eq!(cfg.stats_interval_ms, 1000);
+}

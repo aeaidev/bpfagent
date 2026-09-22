@@ -5,6 +5,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - **kfree_skb** - traces kernel packet drops
 - **SCA** - traces socket communication latency per process
 - **IRSS** - measures UDP-to-raw-IP forwarding latency
+- **IFLAT** - measures interface-to-interface forwarding latency (e.g. eno1 → tun0) across NAT
 - **uprobe** - traces userspace function calls and their arguments
 
 ## Quick Links
@@ -52,6 +53,16 @@ The IRSS program measures how long the IRSS component holds one datagram, from t
 3. Userspace turns the cumulative accumulators into a periodic moving average (per-interval average) exported via Prometheus
 
 Both filters are configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`); unlike SCA, no PID/FD discovery (`ss`/`lsof`) is needed.
+
+### IFLAT Program
+
+The IFLAT program measures how long the kernel holds one UDP datagram while forwarding it between two interfaces — e.g. from ingress on `eno1` to egress on `tun0` — even when nftables NAT (masquerade) rewrites the packet on the way. NAT rewrites addresses, ports and checksums but never the payload, so each datagram is correlated by its first 4 payload bytes (big-endian):
+
+1. On ingress (XDP on `rx_iface`, pre-NAT): stores the receipt timestamp keyed by the payload tag
+2. On egress (TC clsact egress on `tx_iface`, post-NAT): looks up the same tag; on a match it removes the record and accumulates the latency
+3. Userspace turns the cumulative accumulators into a periodic moving average exported via Prometheus (`iflat_avg_latency_us`)
+
+Both interfaces are required settings (`rx_iface`, `tx_iface`) — without them the program stays disabled. Tested end-to-end with the `iflat_sim` example, which builds a netns+veth+tun topology with nftables masquerade and reports the userspace send-to-receive latency for comparison.
 
 ### uprobe Program
 
@@ -105,6 +116,7 @@ The application uses a TOML configuration file to control daemon settings and wh
 pid_file = "/tmp/bpfagent.pid"
 working_directory = "/"
 log_file = "/tmp/bpfagent.log"
+# stats_interval_ms = 3000          # optional: stats/metrics window in ms (default 3000)
 
 # EBPF programs to load and run
 [[ebpf_programs]]
@@ -160,6 +172,11 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - On raw-IP send to the configured destination (default 10.10.10.253): matches the key, removes it, accumulates latency
   - Filters configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`), no PID/FD discovery needed
   - Exports a per-interval moving average via Prometheus
+- **IFLAT program** - measures interface-to-interface forwarding latency of UDP datagrams across NAT
+  - On ingress (XDP on `rx_iface`): stores timestamp keyed by the first 4 payload bytes (NAT-immune correlation key)
+  - On egress (TC clsact egress on `tx_iface`): matches the key, removes it, accumulates latency
+  - Interfaces configured via `[ebpf_programs.settings]` (`rx_iface`, `tx_iface`; required)
+  - Exports a per-interval moving average (`iflat_avg_latency_us`) via Prometheus
 - **uprobe program** - traces userspace function calls and their arguments
   - Attaches a uprobe to a function symbol in a binary or shared library
   - Counts calls per process; snapshots up to 6 argument registers of the most recent call
@@ -376,6 +393,12 @@ scrape_configs:
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `irss_avg_latency_us` | Gauge | | Average UDP-to-raw-IP forwarding latency in microseconds (per-interval moving average; 0 when no traffic) |
+
+#### IFLAT Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `iflat_avg_latency_us` | Gauge | | Average interface-to-interface forwarding latency in microseconds (per-interval moving average; 0 when no traffic) |
 
 #### uprobe Metrics
 

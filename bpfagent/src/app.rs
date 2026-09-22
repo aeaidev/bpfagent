@@ -23,6 +23,7 @@ fn register_programs() -> ProgramRegistry {
 
     // Initialize all program modules - each module registers itself
     // To add a new program, add its module and call its init function here
+    crate::programs::iflat::init(&mut registry);
     crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::sca::init(&mut registry);
@@ -204,6 +205,7 @@ fn setup_prometheus_metrics(
 async fn run_event_loop(
     programs: &mut HashMap<String, Box<dyn EbpfProgram>>,
     cancel_token: CancellationToken,
+    stats_interval_ms: u64,
 ) -> anyhow::Result<()> {
     // Create signal streams for graceful shutdown
     let mut term_stream = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -219,7 +221,8 @@ async fn run_event_loop(
         .collect();
 
     if !metrics_programs.is_empty() {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(stats_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -269,6 +272,10 @@ async fn run_event_loop(
 /// Run-time setup and asynchronous entry point
 pub async fn run(args: BpfAgentArgs, daemon_config: config::DaemonConfig) -> anyhow::Result<()> {
     info!("Entered tokio runtime block_on");
+    anyhow::ensure!(
+        daemon_config.stats_interval_ms > 0,
+        "stats_interval_ms must be greater than 0"
+    );
     bump_memlock_rlimit();
 
     // Register all available programs
@@ -303,7 +310,7 @@ pub async fn run(args: BpfAgentArgs, daemon_config: config::DaemonConfig) -> any
     });
     info!("Metrics server task spawned, waiting for it");
 
-    run_event_loop(&mut programs, cancel_token).await?;
+    run_event_loop(&mut programs, cancel_token, daemon_config.stats_interval_ms).await?;
 
     info!("About to return from main runtime");
     Ok(())

@@ -19,8 +19,9 @@ pub trait MetricsDisplay {
 
     /// Display collected metrics and update Prometheus metrics
     ///
-    /// This is called periodically (typically every 3 seconds) to read data
-    /// from the eBPF program's maps and update Prometheus counters/gauges.
+    /// This is called periodically on the stats interval (default 3 seconds,
+    /// configurable via `stats_interval_ms`) to read data from the eBPF
+    /// program's maps and update Prometheus counters/gauges.
     ///
     /// # Errors
     /// Returns error if metric reading or updating fails

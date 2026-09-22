@@ -12,7 +12,7 @@ Linux, loads multiple eBPF programs into the kernel, periodically reads their
 BPF maps, and exposes the collected data as Prometheus metrics over HTTP
 (default `0.0.0.0:9101/metrics`).
 
-Four eBPF programs ship with the agent:
+Five eBPF programs ship with the agent:
 
 - **kfree_skb** — counts kernel packet drops by reason at the `skb:kfree_skb`
   tracepoint (kernel `enum skb_drop_reason`).
@@ -22,6 +22,12 @@ Four eBPF programs ship with the agent:
 - **irss** — measures UDP-to-raw-IP forwarding latency of the IRSS data flow
   (CRYPTO → IRSS → MAC); datagrams are keyed by their first 4 payload bytes,
   filters are runtime-configurable (`listen_port`, `raw_dest`).
+- **iflat** — measures interface-to-interface forwarding latency of UDP
+  datagrams (e.g. `eno1` → `tun0`) across nftables NAT; an XDP program on
+  the ingress interface and a TC clsact egress classifier on the egress
+  interface correlate datagrams by their first 4 payload bytes (which NAT
+  does not rewrite); interfaces are required settings
+  (`rx_iface`, `tx_iface`), without them the program stays disabled.
 - **uprobe** — traces calls to a function in a userspace binary/shared
   library and snapshots its arguments (up to 6 register values, x86_64 SysV
   ABI); the attach target is runtime-configurable (`target`, `symbol`,
@@ -51,17 +57,19 @@ bpfagent/               # Userspace application (lib + thin `bpfagent` binary)
 │       ├── irss/mod.rs     # IRSS userspace handler (metrics, display)
 │       ├── kfree_skb/mod.rs
 │       ├── sca/mod.rs      # SCA handler (metrics, display, hop discovery)
+│       ├── iflat/mod.rs    # IFLAT handler (metrics, display, XDP/TC attach)
 │       └── uprobe/mod.rs   # uprobe handler (metrics, display, attach config)
 ├── examples/
 │   ├── irss_sim.rs     # IRSS data-flow simulator for end-to-end testing
 │   ├── sca_sim.rs      # SCA pipeline simulator (6 processes, 7 hops)
+│   ├── iflat_sim.rs    # IFLAT topology simulator (netns+veth+tun+NAT; root)
 │   └── uprobe_sim.rs   # uprobe test target (calls a known function in a loop)
 ├── tests/              # Integration tests (no root required)
 ├── build.rs            # Compiles all eBPF crates via aya-build (see below)
 └── Cargo.toml          # Also holds [package.metadata.deb] for cargo-deb
 
 common/<name>/          # Shared types between kernel and userspace
-                        # (irss, kfree_skb, sca, uprobe; no_std-compatible,
+                        # (iflat, irss, kfree_skb, sca, uprobe; no_std-compatible,
                         #  optional `user` feature pulls in aya for userspace)
 ebpf/<name>/            # eBPF kernel program source (#![no_std] #![no_main],
                         # compiled to bpfel-unknown-none)
@@ -76,15 +84,16 @@ scripts/                # setup.sh, build.sh, test.sh, lint.sh, format.sh, relea
 bpfagent.conf           # Development config (current dir is a search path)
 ```
 
-The workspace `default-members` are `bpfagent` + the three `common/*` crates;
+The workspace `default-members` are `bpfagent` + the five `common/*` crates;
 the `ebpf/*` crates are workspace members but are built for the BPF target by
 `bpfagent/build.rs`, not by a plain `cargo build`.
 
 ## Build System Details
 
-- `bpfagent/build.rs` discovers the `irss-ebpf`, `kfree_skb-ebpf`, `sca-ebpf`,
-  and `uprobe-ebpf` packages from workspace metadata and compiles them with
-  `aya-build` (nightly toolchain + `bpf-linker` to `bpfel-unknown-none`). The
+- `bpfagent/build.rs` discovers the `iflat-ebpf`, `irss-ebpf`, `kfree_skb-ebpf`,
+  `sca-ebpf`, and `uprobe-ebpf` packages from workspace metadata and compiles
+  them with `aya-build` (nightly toolchain + `bpf-linker` to
+  `bpfel-unknown-none`). The
   objects land in `OUT_DIR` under their `[[bin]]` names and are embedded into
   the userspace binary with `aya::include_bytes_aligned!`.
 - The same build script transparently compiles every `ebpf/<plugin>/*.c` file
@@ -137,9 +146,10 @@ curl http://localhost:9101/metrics                               # scrape metric
 
 CLI flags: `-d/--daemon`, `-i/--metrics-ip` (default `0.0.0.0`),
 `-p/--metrics-port` (default `9101`), `-v/--verbose`, `-f/--config-file`.
-In interactive mode statistics print to stdout every 3 seconds; the same 3 s
-tick drives BPF-map reads and Prometheus updates (`app.rs` event loop,
-`tokio::select!` over SIGINT/SIGTERM + interval).
+In interactive mode statistics print to stdout on the stats interval
+(`stats_interval_ms`, default 3000 ms); the same tick drives BPF-map reads
+and Prometheus updates (`app.rs` event loop, `tokio::select!` over
+SIGINT/SIGTERM + interval).
 
 ## Testing
 
@@ -267,7 +277,7 @@ Reference: `config/bpfagent.conf.full`.
 - `docs/ARCHITECTURE.md` — component design, traits, event loop, lifecycle
 - `docs/DEVELOPMENT.md` — build/test/debug workflows
 - `docs/PLUGINS.md` / `docs/PLUGINS_C.md` — plugin development (Rust / C)
-- `docs/IRSS.md`, `docs/SCA_DATA_FLOW.md` — per-program data flows
+- `docs/IRSS.md`, `docs/SCA_DATA_FLOW.md`, `docs/IFLAT.md` — per-program data flows
 - `docs/UPROBE.md` — uprobe settings, symbol requirements, sim walkthrough
 - `docs/bpfagent.1` — man page (`man -l docs/bpfagent.1`)
 - `CHANGELOG.md` — version history (Keep a Changelog)

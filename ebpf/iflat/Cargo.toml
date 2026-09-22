@@ -1,0 +1,17 @@
+[package]
+name = "iflat-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+iflat-common = { path = "../../common/iflat" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "iflat"
+path = "src/main.rs"

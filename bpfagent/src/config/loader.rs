@@ -65,11 +65,20 @@ fn default_programs() -> Vec<EbpfProgramConfig> {
     Vec::new() // Empty list means enable all registered programs
 }
 
+fn default_stats_interval_ms() -> u64 {
+    3_000
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
     pub pid_file: String,
     pub working_directory: String,
     pub log_file: String,
+    /// Interval driving BPF-map reads, metrics display (interactive stdout
+    /// print) and Prometheus updates, in milliseconds. Each program reports
+    /// per-interval averages/deltas over this window. Must be > 0.
+    #[serde(default = "default_stats_interval_ms")]
+    pub stats_interval_ms: u64,
     #[serde(default = "default_programs")]
     pub ebpf_programs: Vec<EbpfProgramConfig>,
 }
@@ -80,6 +89,7 @@ impl Default for DaemonConfig {
             pid_file: "/tmp/bpfagent.pid".to_string(),
             working_directory: "/".to_string(),
             log_file: "/tmp/bpfagent.log".to_string(),
+            stats_interval_ms: default_stats_interval_ms(),
             ebpf_programs: default_programs(),
         }
     }

@@ -4,6 +4,8 @@
 pid_file = "/tmp/bpfagent.pid"
 working_directory = "/"
 log_file = "/tmp/bpfagent.log"
+# Optional: stats/metrics interval in ms (default 3000)
+# stats_interval_ms = 3000
 
 # EBPF programs to load and run
 [[ebpf_programs]]
@@ -21,6 +23,16 @@ enabled = true
 # [ebpf_programs.settings]
 # listen_port = 5020
 # raw_dest = "10.10.10.253"
+
+[[ebpf_programs]]
+name = "iflat"
+enabled = false
+# Measures interface-to-interface forwarding latency of UDP datagrams (e.g.
+# eno1 -> tun0 across nftables NAT) by correlating the first 4 payload bytes.
+# Required settings (no defaults; the program stays disabled without them):
+# [ebpf_programs.settings]
+# rx_iface = "eno1"   # ingress interface (XDP)
+# tx_iface = "tun0"   # egress interface (TC clsact egress)
 
 [[ebpf_programs]]
 name = "uprobe"
