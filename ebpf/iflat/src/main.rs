@@ -38,8 +38,16 @@ const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_UDP: u8 = 17;
 /// IP protocol number for TCP.
 const IPPROTO_TCP: u8 = 6;
+/// IP protocol number for ICMP.
+const IPPROTO_ICMP: u8 = 1;
 /// UDP header length.
 const UDP_HLEN: usize = 8;
+/// ICMP echo request/reply header length (the only ICMP messages with a
+/// payload worth tagging).
+const ICMP_HLEN: usize = 8;
+/// ICMP echo reply / echo request type numbers.
+const ICMP_ECHOREPLY: u8 = 0;
+const ICMP_ECHO: u8 = 8;
 
 /// TC return code: let the packet continue unaffected (observe-only).
 const TC_ACT_OK: i32 = 0;
@@ -59,8 +67,9 @@ pub fn iflat_tc_tx(ctx: TcContext) -> i32 {
 }
 
 /// RX side (XDP on the ingress interface, e.g. eno1): the frame still carries
-/// its Ethernet header. Parse IPv4 + UDP/TCP and store the receipt timestamp
-/// keyed on the payload tag. Runs before routing and netfilter, i.e. pre-NAT.
+/// its Ethernet header. Parse IPv4 + UDP/TCP/ICMP-echo and store the receipt
+/// timestamp keyed on the payload tag. Runs before routing and netfilter,
+/// i.e. pre-NAT.
 fn xdp_rx_handler(ctx: &XdpContext) -> Result<u32, u32> {
     let data = ctx.data();
     let end = ctx.data_end();
@@ -134,10 +143,11 @@ fn read_be_u16(data: usize, end: usize, off: usize) -> Option<u16> {
     Some(u16::from_be_bytes([hi, lo]))
 }
 
-/// Extract the payload tag of a UDP or TCP datagram whose IPv4 header starts
-/// `l3` bytes from `data`: the first KEY_SIZE payload bytes, big-endian.
-/// Returns None for non-IPv4, non-UDP/TCP, or truncated packets, and for
-/// TCP segments with less than KEY_SIZE payload bytes (e.g. pure ACKs).
+/// Extract the payload tag of a UDP, TCP or ICMP-echo datagram whose IPv4
+/// header starts `l3` bytes from `data`: the first KEY_SIZE payload bytes,
+/// big-endian. Returns None for non-IPv4, other protocols, non-echo ICMP, or
+/// truncated packets, and for TCP segments with less than KEY_SIZE payload
+/// bytes (e.g. pure ACKs).
 ///
 /// All bounds checks use aggregate `data + N > data_end` comparisons: the
 /// verifier refines packet-pointer ranges from this (JGT) comparison shape,
@@ -159,8 +169,9 @@ fn parse_payload_tag(data: usize, end: usize, l3: usize) -> Option<u32> {
     }
     let protocol = unsafe { *((data + l3 + 9) as *const u8) };
 
-    // L4 header length: fixed for UDP, taken from the data-offset field for
-    // TCP. The L4 header itself is not inspected beyond that.
+    // L4 header length: fixed for UDP and ICMP echo, taken from the
+    // data-offset field for TCP. The L4 header itself is not inspected
+    // beyond the TCP data offset and the ICMP type.
     let l4 = l3 + ihl;
     let l4_hlen = match protocol {
         IPPROTO_UDP => UDP_HLEN,
@@ -174,6 +185,19 @@ fn parse_payload_tag(data: usize, end: usize, l3: usize) -> Option<u32> {
                 return None;
             }
             hlen
+        }
+        IPPROTO_ICMP => {
+            if data + l4 + ICMP_HLEN > end {
+                return None;
+            }
+            // Only echo request/reply carry a taggable payload. NAT rewrites
+            // the echo identifier (conntrack treats it like a port), so the
+            // tag must come from the payload, never from id/seq.
+            let icmp_type = unsafe { *((data + l4) as *const u8) };
+            if icmp_type != ICMP_ECHO && icmp_type != ICMP_ECHOREPLY {
+                return None;
+            }
+            ICMP_HLEN
         }
         _ => return None,
     };

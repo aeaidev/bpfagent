@@ -1,18 +1,20 @@
 # IFLAT
 
-IFLAT measures the interface-to-interface forwarding latency of UDP and TCP
-datagrams: how long the kernel holds one datagram from ingress on the RX
-interface (e.g. `eno1`) to egress on the TX interface (e.g. `tun0`). The
-forwarding path may apply NAT (nftables masquerade, see
+IFLAT measures the interface-to-interface forwarding latency of UDP, TCP
+and ICMP-echo datagrams: how long the kernel holds one datagram from
+ingress on the RX interface (e.g. `eno1`) to egress on the TX interface
+(e.g. `tun0`). The forwarding path may apply NAT (nftables masquerade, see
 `/etc/nftables.conf`): addresses, ports and checksums are rewritten, but the
 payload is not, so each datagram is correlated by the tag in its first 4
-payload bytes (big-endian) — the same key before and after NAT.
+payload bytes (big-endian) — the same key before and after NAT. (Note that
+masquerade *does* rewrite the ICMP echo identifier, treating it like a
+port — which is exactly why the tag comes from the payload.)
 
 ### Data Flow
 
 ```mermaid
 flowchart TD
-    SRC[Sender] --> |UDP/TCP datagram| RX[eno1 ingress<br/>XDP: store timestamp by payload tag]
+    SRC[Sender] --> |UDP/TCP/ICMP datagram| RX[eno1 ingress<br/>XDP: store timestamp by payload tag]
     RX --> FWD[routing + nftables masquerade]
     FWD --> TX[tun0 egress<br/>TC clsact: match tag, accumulate latency]
     TX --> APP[receiver behind tun0]
@@ -21,11 +23,11 @@ flowchart TD
 #### Latency Measurement Approach
 
 1. On ingress (`iflat_xdp_rx`, XDP on `rx_iface`, pre-NAT): parse
-   Ethernet/IPv4 + UDP/TCP and store
+   Ethernet/IPv4 + UDP/TCP/ICMP-echo and store
    `TIMESTAMP_MAP[tag] = bpf_ktime_get_ns()`
 2. On egress (`iflat_tc_tx`, TC clsact egress on `tx_iface`, post-NAT): parse
-   IPv4 + UDP/TCP (a tun device has no L2 header) and look up the tag; on a
-   match remove the record and add the latency to the
+   IPv4 + UDP/TCP/ICMP-echo (a tun device has no L2 header) and look up the
+   tag; on a match remove the record and add the latency to the
    `LATENCY_SUM`/`LATENCY_COUNT` accumulators
 3. Userspace turns the accumulators into a periodic moving average
 
@@ -33,7 +35,7 @@ flowchart TD
 
 | Program | Hook | Role |
 |---------|------|------|
-| `iflat_xdp_rx` | XDP on `rx_iface` | RX: store the receipt timestamp keyed by the payload tag (first 4 UDP/TCP payload bytes, big-endian). Runs before routing and netfilter |
+| `iflat_xdp_rx` | XDP on `rx_iface` | RX: store the receipt timestamp keyed by the payload tag (first 4 UDP/TCP/ICMP payload bytes, big-endian). Runs before routing and netfilter |
 | `iflat_tc_tx` | TC clsact egress on `tx_iface` | TX: match the tag; on a hit compute `now - stored`, accumulate, remove. Runs after POSTROUTING, before the egress qdisc |
 
 The measured span is the pure in-kernel forwarding path: stack input,
@@ -90,6 +92,10 @@ adds the `clsact` qdisc on `tx_iface` before attaching.
   ACKs) are skipped. TSO super-packets on the TX path still carry the tag at
   the same payload offset, so they match once; per-segment latency for bulk
   TCP streams is approximate
+- ICMP echo request/reply only (other ICMP types carry no taggable
+  payload); the echo identifier is rewritten by masquerade, so correlation
+  uses the payload — stock `ping` payloads start with a timeval and make
+  weak tags, so measured traffic should embed its own tag prefix
 - The RX side expects an Ethernet header (XDP on a L2 interface), the TX
   side expects a bare IP packet (TC on a L3/tun interface)
 - Datagrams must carry a unique 4-byte prefix in their payload to be
@@ -108,11 +114,12 @@ simulated with a network namespace and a veth pair):
   fd open and reads the forwarded datagrams back
 - nftables masquerade towards tun0 mirrors the production
   `/etc/nftables.conf` setup (dedicated table `iflat-sim`)
-- the simulator re-executes itself inside the namespace and alternates one
-  UDP datagram to 10.200.0.2:5000 and one crafted TCP segment to
-  10.200.0.2:5001 every 500 ms (nothing answers at the destination, so the
-  TCP segments are built statelessly on a raw socket: SYN with payload,
-  fresh source port per segment, proper checksum — conntrack accepts and
+- the simulator re-executes itself inside the namespace and rotates through
+  one UDP datagram to 10.200.0.2:5000, one crafted TCP segment to
+  10.200.0.2:5001 and one crafted ICMP echo request per 500 ms cycle
+  (nothing answers at the destination, so TCP/ICMP are built statelessly on
+  a raw socket: SYN with payload and a fresh source port per segment, echo
+  with a random id, both with proper checksums — conntrack accepts and
   masquerades them without a handshake). Each datagram carries a random
   4-byte tag plus its CLOCK_MONOTONIC send timestamp
 - per received datagram it prints the userspace send-to-receive latency —

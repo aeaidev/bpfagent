@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TCP header (data-offset field) in addition to UDP, and `iflat_sim`
   alternates UDP datagrams with crafted TCP segments (stateless SYN with
   payload, so no handshake is needed)
+- IFLAT now also measures ICMP echo request/reply: correlation uses the
+  payload tag because masquerade rewrites the echo identifier (conntrack
+  treats it like a port); `iflat_sim` rotates UDP/TCP/ICMP and crafts the
+  echo requests on the same raw socket
 - uprobe eBPF program: traces calls to a function in a userspace
   binary/shared library and snapshots its arguments (up to 6 register
   values, x86_64 SysV ABI). The attach target is runtime-configurable via

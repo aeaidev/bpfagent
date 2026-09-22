@@ -17,11 +17,12 @@
 //! of the pair (veth-iflat0) plays the role of the production RX interface
 //! (eno1); nftables masquerade towards tun0 mirrors /etc/nftables.conf.
 //!
-//! The sender alternates one UDP datagram and one TCP segment per cycle.
-//! Nothing at the destination answers, so TCP cannot go through a real
-//! connection: the segments are crafted statelessly on a raw socket (SYN
-//! with payload, fresh source port per segment, proper checksum) so
-//! conntrack accepts and masquerades them without any handshake.
+//! The sender rotates through one UDP datagram, one TCP segment and one
+//! ICMP echo request per cycle. Nothing at the destination answers, so TCP
+//! and ICMP are crafted statelessly on a raw socket (TCP: SYN with payload,
+//! fresh source port per segment; ICMP: echo request with a random id; both
+//! with proper checksums) so conntrack accepts and masquerades them without
+//! any handshake.
 //!
 //! Usage (requires root; iproute2 and nftables must be installed):
 //!   sudo ./target/debug/examples/iflat_sim [NETEM_DELAY_MS]
@@ -65,6 +66,9 @@ const VETH_NS_IP_OCTETS: [u8; 4] = [192, 168, 100, 2];
 /// IP protocol numbers used when parsing/crafting packets.
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_ICMP: u8 = 1;
+/// ICMP echo request type (the segments the sender crafts).
+const ICMP_ECHO: u8 = 8;
 /// nftables table holding the masquerade rule; deleted whole on teardown.
 const NFT_TABLE: &str = "iflat-sim";
 
@@ -306,6 +310,21 @@ fn add_checksum_words(sum: &mut u32, data: &[u8]) {
     }
 }
 
+/// Fold a 32-bit one's-complement accumulator into the final 16-bit checksum.
+fn fold_checksum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Internet checksum (RFC 1071) over `data`.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    add_checksum_words(&mut sum, data);
+    fold_checksum(sum)
+}
+
 /// TCP checksum (RFC 793): one's complement of the one's-complement sum over
 /// the pseudo-header (src, dst, protocol, TCP length) and the TCP segment.
 /// Computed properly so conntrack accepts the crafted segments; NAT adjusts
@@ -317,10 +336,7 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
     sum += u32::from(IPPROTO_TCP);
     sum += segment.len() as u32;
     add_checksum_words(&mut sum, segment);
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    fold_checksum(sum)
 }
 
 /// Build one crafted TCP segment (IPv4 + TCP + payload) in `pkt`, returning
@@ -377,18 +393,59 @@ fn craft_tcp_segment(pkt: &mut [u8], tag: u32, sent_ns: u64) -> usize {
     total
 }
 
-/// Sender role (runs inside the namespace): alternates one UDP datagram and
-/// one crafted TCP segment every SEND_INTERVAL, each carrying a random
-/// 4-byte tag (the agent's correlation key) and its CLOCK_MONOTONIC send
-/// timestamp (the simulator's key).
+/// Build one crafted ICMP echo request (IPv4 + ICMP + payload) in `pkt`,
+/// returning its length: type 8, random identifier, payload carrying the
+/// 4-byte tag and the 8-byte send timestamp in the same layout as the UDP
+/// datagrams. The identifier would be rewritten by masquerade (conntrack
+/// treats it like a port), so the correlation tag lives in the payload.
+fn craft_icmp_echo(pkt: &mut [u8], tag: u32, sent_ns: u64, seq: u16) -> usize {
+    const IP_HLEN: usize = 20;
+    const ICMP_HLEN: usize = 8;
+    let total = IP_HLEN + ICMP_HLEN + MSG_SIZE;
+
+    // IPv4 header; the kernel fills the header checksum (IP_HDRINCL).
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[1] = 0; // TOS
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[4..6].copy_from_slice(&0u16.to_be_bytes()); // ID
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    pkt[8] = 64; // TTL
+    pkt[9] = IPPROTO_ICMP;
+    pkt[10..12].copy_from_slice(&0u16.to_be_bytes()); // header checksum
+    pkt[12..16].copy_from_slice(&VETH_NS_IP_OCTETS);
+    pkt[16..20].copy_from_slice(&DEST_IP);
+
+    // ICMP echo request header.
+    let icmp = IP_HLEN;
+    pkt[icmp] = ICMP_ECHO;
+    pkt[icmp + 1] = 0; // code
+    pkt[icmp + 2..icmp + 4].copy_from_slice(&0u16.to_be_bytes()); // checksum
+    pkt[icmp + 4..icmp + 6].copy_from_slice(&rand::random::<u16>().to_be_bytes()); // id
+    pkt[icmp + 6..icmp + 8].copy_from_slice(&seq.to_be_bytes());
+
+    // Payload: same tag + timestamp layout as the UDP datagrams.
+    let payload = icmp + ICMP_HLEN;
+    pkt[payload..payload + 4].copy_from_slice(&tag.to_be_bytes());
+    pkt[payload + 4..payload + 12].copy_from_slice(&sent_ns.to_be_bytes());
+
+    let cksum = internet_checksum(&pkt[icmp..icmp + ICMP_HLEN + MSG_SIZE]);
+    pkt[icmp + 2..icmp + 4].copy_from_slice(&cksum.to_be_bytes());
+
+    total
+}
+
+/// Sender role (runs inside the namespace): rotates through one UDP
+/// datagram, one crafted TCP segment and one crafted ICMP echo request per
+/// cycle, each carrying a random 4-byte tag (the agent's correlation key)
+/// and its CLOCK_MONOTONIC send timestamp (the simulator's key).
 fn run_sender() {
     let udp = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => fatal(&format!("sender UDP bind failed: {}", e)),
     };
-    // Raw socket for the crafted TCP segments (IP_HDRINCL is implied by
-    // IPPROTO_RAW): nothing at the destination answers, so real TCP
-    // connections cannot be used.
+    // Raw socket for the crafted TCP/ICMP packets (IP_HDRINCL is implied by
+    // IPPROTO_RAW): nothing at the destination answers, so real connections
+    // cannot be used.
     let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
     if raw_fd < 0 {
         fatal(&format!(
@@ -409,31 +466,42 @@ fn run_sender() {
     loop {
         let tag = rand::random::<u32>();
         let sent_ns = monotonic_ns();
-        if cycle % 2 == 0 {
-            let mut buf = [0u8; MSG_SIZE];
-            buf[..4].copy_from_slice(&tag.to_be_bytes());
-            buf[4..12].copy_from_slice(&sent_ns.to_be_bytes());
-            if let Err(e) = udp.send_to(&buf, DEST) {
-                eprintln!("iflat_sim[sender]: UDP send_to({}) failed: {}", DEST, e);
+        match cycle % 3 {
+            0 => {
+                let mut buf = [0u8; MSG_SIZE];
+                buf[..4].copy_from_slice(&tag.to_be_bytes());
+                buf[4..12].copy_from_slice(&sent_ns.to_be_bytes());
+                if let Err(e) = udp.send_to(&buf, DEST) {
+                    eprintln!("iflat_sim[sender]: UDP send_to({}) failed: {}", DEST, e);
+                }
             }
-        } else {
-            let mut pkt = [0u8; 128];
-            let len = craft_tcp_segment(&mut pkt, tag, sent_ns);
-            let sent = unsafe {
-                libc::sendto(
-                    raw_fd,
-                    pkt.as_ptr() as *const libc::c_void,
-                    len,
-                    0,
-                    &raw_dest as *const libc::sockaddr_in as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            };
-            if sent < 0 {
-                eprintln!(
-                    "iflat_sim[sender]: TCP sendto failed: {}",
-                    std::io::Error::last_os_error()
-                );
+            proto => {
+                let mut pkt = [0u8; 128];
+                let (len, name) = if proto == 1 {
+                    (craft_tcp_segment(&mut pkt, tag, sent_ns), "TCP")
+                } else {
+                    (
+                        craft_icmp_echo(&mut pkt, tag, sent_ns, cycle as u16),
+                        "ICMP",
+                    )
+                };
+                let sent = unsafe {
+                    libc::sendto(
+                        raw_fd,
+                        pkt.as_ptr() as *const libc::c_void,
+                        len,
+                        0,
+                        &raw_dest as *const libc::sockaddr_in as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if sent < 0 {
+                    eprintln!(
+                        "iflat_sim[sender]: {} sendto failed: {}",
+                        name,
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
         }
         cycle += 1;
@@ -448,8 +516,8 @@ fn run_sender() {
 /// off the tun fd. Returns None for anything that is not one of our test
 /// datagrams: foreign UDP traffic also leaves via tun0 (the host's
 /// mDNS/LLMNR announcements appear as soon as the interface comes up), so
-/// check the destination address and port before trusting the payload
-/// layout.
+/// check the destination address plus the destination port (UDP/TCP) or the
+/// echo type (ICMP) before trusting the payload layout.
 fn parse_packet(pkt: &[u8]) -> Option<(u32, u64, &'static str)> {
     let version_ihl = *pkt.first()?;
     if version_ihl >> 4 != 4 {
@@ -463,16 +531,25 @@ fn parse_packet(pkt: &[u8]) -> Option<(u32, u64, &'static str)> {
         return None;
     }
     let protocol = *pkt.get(9)?;
-    let dport = u16::from_be_bytes(pkt.get(ihl + 2..ihl + 4)?.try_into().ok()?);
     let (l4_hlen, name) = match protocol {
-        IPPROTO_UDP if dport == DEST_PORT => (8, "udp"),
-        IPPROTO_TCP if dport == TCP_DEST_PORT => {
+        IPPROTO_UDP
+            if u16::from_be_bytes(pkt.get(ihl + 2..ihl + 4)?.try_into().ok()?) == DEST_PORT =>
+        {
+            (8, "udp")
+        }
+        IPPROTO_TCP
+            if u16::from_be_bytes(pkt.get(ihl + 2..ihl + 4)?.try_into().ok()?) == TCP_DEST_PORT =>
+        {
             let hlen = usize::from(pkt.get(ihl + 12)? >> 4) * 4;
             if hlen < 20 {
                 return None;
             }
             (hlen, "tcp")
         }
+        // Our crafted echo requests; there is no port to filter on, so match
+        // the ICMP type instead (the DEST_IP check above excludes foreign
+        // traffic).
+        IPPROTO_ICMP if *pkt.get(ihl)? == ICMP_ECHO => (8, "icmp"),
         _ => return None,
     };
     let payload = pkt.get(ihl + l4_hlen..)?;
@@ -554,7 +631,7 @@ fn main() {
     setup(netem_delay_ms);
 
     eprintln!(
-        "iflat_sim: sender in netns '{}' alternates UDP to {} and crafted TCP to 10.200.0.2:{} every {:?};",
+        "iflat_sim: sender in netns '{}' rotates UDP to {}, crafted TCP to 10.200.0.2:{} and crafted ICMP echo every {:?};",
         NETNS, DEST, TCP_DEST_PORT, SEND_INTERVAL
     );
     eprintln!(
