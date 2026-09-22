@@ -56,7 +56,7 @@ Both filters are configurable via `[ebpf_programs.settings]` (`listen_port`, `ra
 
 ### IFLAT Program
 
-The IFLAT program measures how long the kernel holds one UDP datagram while forwarding it between two interfaces — e.g. from ingress on `eno1` to egress on `tun0` — even when nftables NAT (masquerade) rewrites the packet on the way. NAT rewrites addresses, ports and checksums but never the payload, so each datagram is correlated by its first 4 payload bytes (big-endian):
+The IFLAT program measures how long the kernel holds one UDP or TCP datagram while forwarding it between two interfaces — e.g. from ingress on `eno1` to egress on `tun0` — even when nftables NAT (masquerade) rewrites the packet on the way. NAT rewrites addresses, ports and checksums but never the payload, so each datagram is correlated by its first 4 payload bytes (big-endian):
 
 1. On ingress (XDP on `rx_iface`, pre-NAT): stores the receipt timestamp keyed by the payload tag
 2. On egress (TC clsact egress on `tx_iface`, post-NAT): looks up the same tag; on a match it removes the record and accumulates the latency
@@ -172,7 +172,7 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - On raw-IP send to the configured destination (default 10.10.10.253): matches the key, removes it, accumulates latency
   - Filters configurable via `[ebpf_programs.settings]` (`listen_port`, `raw_dest`), no PID/FD discovery needed
   - Exports a per-interval moving average via Prometheus
-- **IFLAT program** - measures interface-to-interface forwarding latency of UDP datagrams across NAT
+- **IFLAT program** - measures interface-to-interface forwarding latency of UDP/TCP datagrams across NAT
   - On ingress (XDP on `rx_iface`): stores timestamp keyed by the first 4 payload bytes (NAT-immune correlation key)
   - On egress (TC clsact egress on `tx_iface`): matches the key, removes it, accumulates latency
   - Interfaces configured via `[ebpf_programs.settings]` (`rx_iface`, `tx_iface`; required)

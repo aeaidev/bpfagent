@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive statistics print and Prometheus updates, so per-interval
   averages/deltas (e.g. `iflat_avg_latency_us`, `irss_avg_latency_us`) cover
   that window
+- IFLAT now also measures TCP datagrams: the payload-tag parser handles the
+  TCP header (data-offset field) in addition to UDP, and `iflat_sim`
+  alternates UDP datagrams with crafted TCP segments (stateless SYN with
+  payload, so no handshake is needed)
 - uprobe eBPF program: traces calls to a function in a userspace
   binary/shared library and snapshots its arguments (up to 6 register
   values, x86_64 SysV ABI). The attach target is runtime-configurable via

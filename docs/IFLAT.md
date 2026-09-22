@@ -1,6 +1,6 @@
 # IFLAT
 
-IFLAT measures the interface-to-interface forwarding latency of UDP
+IFLAT measures the interface-to-interface forwarding latency of UDP and TCP
 datagrams: how long the kernel holds one datagram from ingress on the RX
 interface (e.g. `eno1`) to egress on the TX interface (e.g. `tun0`). The
 forwarding path may apply NAT (nftables masquerade, see
@@ -12,7 +12,7 @@ payload bytes (big-endian) — the same key before and after NAT.
 
 ```mermaid
 flowchart TD
-    SRC[Sender] --> |UDP datagram| RX[eno1 ingress<br/>XDP: store timestamp by payload tag]
+    SRC[Sender] --> |UDP/TCP datagram| RX[eno1 ingress<br/>XDP: store timestamp by payload tag]
     RX --> FWD[routing + nftables masquerade]
     FWD --> TX[tun0 egress<br/>TC clsact: match tag, accumulate latency]
     TX --> APP[receiver behind tun0]
@@ -21,10 +21,11 @@ flowchart TD
 #### Latency Measurement Approach
 
 1. On ingress (`iflat_xdp_rx`, XDP on `rx_iface`, pre-NAT): parse
-   Ethernet/IPv4/UDP and store `TIMESTAMP_MAP[tag] = bpf_ktime_get_ns()`
+   Ethernet/IPv4 + UDP/TCP and store
+   `TIMESTAMP_MAP[tag] = bpf_ktime_get_ns()`
 2. On egress (`iflat_tc_tx`, TC clsact egress on `tx_iface`, post-NAT): parse
-   IPv4/UDP (a tun device has no L2 header) and look up the tag; on a match
-   remove the record and add the latency to the
+   IPv4 + UDP/TCP (a tun device has no L2 header) and look up the tag; on a
+   match remove the record and add the latency to the
    `LATENCY_SUM`/`LATENCY_COUNT` accumulators
 3. Userspace turns the accumulators into a periodic moving average
 
@@ -32,7 +33,7 @@ flowchart TD
 
 | Program | Hook | Role |
 |---------|------|------|
-| `iflat_xdp_rx` | XDP on `rx_iface` | RX: store the receipt timestamp keyed by the payload tag (first 4 UDP payload bytes, big-endian). Runs before routing and netfilter |
+| `iflat_xdp_rx` | XDP on `rx_iface` | RX: store the receipt timestamp keyed by the payload tag (first 4 UDP/TCP payload bytes, big-endian). Runs before routing and netfilter |
 | `iflat_tc_tx` | TC clsact egress on `tx_iface` | TX: match the tag; on a hit compute `now - stored`, accumulate, remove. Runs after POSTROUTING, before the egress qdisc |
 
 The measured span is the pure in-kernel forwarding path: stack input,
@@ -84,7 +85,11 @@ adds the `clsact` qdisc on `tx_iface` before attaching.
 
 ### Limitations
 
-- IPv4 and UDP only; no VLAN tags, no IP fragmentation handling
+- IPv4 only (no IPv6); no VLAN tags, no IP fragmentation handling
+- UDP and TCP payloads; TCP segments with less than 4 payload bytes (pure
+  ACKs) are skipped. TSO super-packets on the TX path still carry the tag at
+  the same payload offset, so they match once; per-segment latency for bulk
+  TCP streams is approximate
 - The RX side expects an Ethernet header (XDP on a L2 interface), the TX
   side expects a bare IP packet (TC on a L3/tun interface)
 - Datagrams must carry a unique 4-byte prefix in their payload to be
@@ -103,9 +108,13 @@ simulated with a network namespace and a veth pair):
   fd open and reads the forwarded datagrams back
 - nftables masquerade towards tun0 mirrors the production
   `/etc/nftables.conf` setup (dedicated table `iflat-sim`)
-- the simulator re-executes itself inside the namespace and sends a UDP
-  datagram to 10.200.0.2 every 500 ms, each carrying a random 4-byte tag
-  plus its CLOCK_MONOTONIC send timestamp
+- the simulator re-executes itself inside the namespace and alternates one
+  UDP datagram to 10.200.0.2:5000 and one crafted TCP segment to
+  10.200.0.2:5001 every 500 ms (nothing answers at the destination, so the
+  TCP segments are built statelessly on a raw socket: SYN with payload,
+  fresh source port per segment, proper checksum — conntrack accepts and
+  masquerades them without a handshake). Each datagram carries a random
+  4-byte tag plus its CLOCK_MONOTONIC send timestamp
 - per received datagram it prints the userspace send-to-receive latency —
   a superset of the agent's in-kernel span (it also covers the
   netns → veth delivery), so the sim's values are the upper bound for

@@ -36,6 +36,8 @@ const ETH_HLEN: usize = 14;
 const ETH_P_IP: u16 = 0x0800;
 /// IP protocol number for UDP.
 const IPPROTO_UDP: u8 = 17;
+/// IP protocol number for TCP.
+const IPPROTO_TCP: u8 = 6;
 /// UDP header length.
 const UDP_HLEN: usize = 8;
 
@@ -57,8 +59,8 @@ pub fn iflat_tc_tx(ctx: TcContext) -> i32 {
 }
 
 /// RX side (XDP on the ingress interface, e.g. eno1): the frame still carries
-/// its Ethernet header. Parse IPv4/UDP and store the receipt timestamp keyed
-/// on the payload tag. Runs before routing and netfilter, i.e. pre-NAT.
+/// its Ethernet header. Parse IPv4 + UDP/TCP and store the receipt timestamp
+/// keyed on the payload tag. Runs before routing and netfilter, i.e. pre-NAT.
 fn xdp_rx_handler(ctx: &XdpContext) -> Result<u32, u32> {
     let data = ctx.data();
     let end = ctx.data_end();
@@ -70,7 +72,7 @@ fn xdp_rx_handler(ctx: &XdpContext) -> Result<u32, u32> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let Some(tag) = parse_udp_tag(data, end, ETH_HLEN) else {
+    let Some(tag) = parse_payload_tag(data, end, ETH_HLEN) else {
         return Ok(xdp_action::XDP_PASS);
     };
 
@@ -88,12 +90,14 @@ fn xdp_rx_handler(ctx: &XdpContext) -> Result<u32, u32> {
 /// TX side (TC clsact egress on the egress interface, e.g. tun0): a tun
 /// device has no L2 header, so the packet starts at the IP header. Runs after
 /// routing and netfilter POSTROUTING, i.e. post-NAT — masquerading rewrote
-/// addresses and ports but not the payload, so the tag still matches.
+/// addresses and ports but not the payload, so the tag still matches. TSO
+/// super-packets (if the NIC segments later) still carry the tag at the same
+/// payload offset, so they match once.
 fn tc_tx_handler(ctx: &TcContext) -> Result<i32, i32> {
     let data = ctx.data();
     let end = ctx.data_end();
 
-    let Some(tag) = parse_udp_tag(data, end, 0) else {
+    let Some(tag) = parse_payload_tag(data, end, 0) else {
         return Ok(TC_ACT_OK);
     };
 
@@ -130,16 +134,17 @@ fn read_be_u16(data: usize, end: usize, off: usize) -> Option<u16> {
     Some(u16::from_be_bytes([hi, lo]))
 }
 
-/// Extract the payload tag of a UDP datagram whose IPv4 header starts `l3`
-/// bytes from `data`: the first KEY_SIZE payload bytes, big-endian. Returns
-/// None for non-IPv4, non-UDP, or truncated packets.
+/// Extract the payload tag of a UDP or TCP datagram whose IPv4 header starts
+/// `l3` bytes from `data`: the first KEY_SIZE payload bytes, big-endian.
+/// Returns None for non-IPv4, non-UDP/TCP, or truncated packets, and for
+/// TCP segments with less than KEY_SIZE payload bytes (e.g. pure ACKs).
 ///
 /// All bounds checks use aggregate `data + N > data_end` comparisons: the
 /// verifier refines packet-pointer ranges from this (JGT) comparison shape,
 /// while the `data >= data_end` fold LLVM emits for a `+1` check is not
 /// refined (seen on sched_cls: "R1 min value is outside of the allowed
 /// memory range").
-fn parse_udp_tag(data: usize, end: usize, l3: usize) -> Option<u32> {
+fn parse_payload_tag(data: usize, end: usize, l3: usize) -> Option<u32> {
     // One check covers the fixed-size IPv4 header fields read below.
     if data + l3 + 20 > end {
         return None;
@@ -153,15 +158,31 @@ fn parse_udp_tag(data: usize, end: usize, l3: usize) -> Option<u32> {
         return None;
     }
     let protocol = unsafe { *((data + l3 + 9) as *const u8) };
-    if protocol != IPPROTO_UDP {
-        return None;
-    }
 
-    // The UDP header itself is not inspected; one aggregate check covers the
-    // whole tag, so the four single-byte reads below are provably inside the
-    // packet (a per-byte check inside the loop compiles to pointer min()
-    // arithmetic the verifier cannot track).
-    let payload_off = l3 + ihl + UDP_HLEN;
+    // L4 header length: fixed for UDP, taken from the data-offset field for
+    // TCP. The L4 header itself is not inspected beyond that.
+    let l4 = l3 + ihl;
+    let l4_hlen = match protocol {
+        IPPROTO_UDP => UDP_HLEN,
+        IPPROTO_TCP => {
+            if data + l4 + 20 > end {
+                return None;
+            }
+            let data_offset = unsafe { *((data + l4 + 12) as *const u8) };
+            let hlen = usize::from(data_offset >> 4) * 4;
+            if hlen < 20 {
+                return None;
+            }
+            hlen
+        }
+        _ => return None,
+    };
+
+    // One aggregate check covers the whole tag, so the four single-byte
+    // reads below are provably inside the packet (a per-byte check inside
+    // the loop compiles to pointer min() arithmetic the verifier cannot
+    // track).
+    let payload_off = l4 + l4_hlen;
     if data + payload_off + KEY_SIZE > end {
         return None;
     }

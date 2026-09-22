@@ -22,7 +22,7 @@ Five eBPF programs ship with the agent:
 - **irss** — measures UDP-to-raw-IP forwarding latency of the IRSS data flow
   (CRYPTO → IRSS → MAC); datagrams are keyed by their first 4 payload bytes,
   filters are runtime-configurable (`listen_port`, `raw_dest`).
-- **iflat** — measures interface-to-interface forwarding latency of UDP
+- **iflat** — measures interface-to-interface forwarding latency of UDP/TCP
   datagrams (e.g. `eno1` → `tun0`) across nftables NAT; an XDP program on
   the ingress interface and a TC clsact egress classifier on the egress
   interface correlate datagrams by their first 4 payload bytes (which NAT

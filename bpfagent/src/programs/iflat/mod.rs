@@ -1,22 +1,23 @@
 //! IFLAT eBPF Program - Interface-to-Interface Forwarding Latency
 //!
 //! This module provides a BPF program that measures how long the kernel
-//! holds one UDP datagram while forwarding it between two interfaces: from
-//! ingress on the RX interface (e.g. eno1) to egress on the TX interface
-//! (e.g. tun0). The forwarding path may apply NAT (nftables masquerade):
-//! addresses, ports and checksums are rewritten, but the payload is not, so
-//! each datagram is keyed on the tag in its first 4 payload bytes
-//! (big-endian) — the same correlation key before and after NAT.
+//! holds one UDP or TCP datagram while forwarding it between two interfaces:
+//! from ingress on the RX interface (e.g. eno1) to egress on the TX
+//! interface (e.g. tun0). The forwarding path may apply NAT (nftables
+//! masquerade): addresses, ports and checksums are rewritten, but the
+//! payload is not, so each datagram is keyed on the tag in its first 4
+//! payload bytes (big-endian) — the same correlation key before and after
+//! NAT.
 //!
 //! The eBPF side has two programs (see ebpf/iflat):
-//! - RX (`iflat_xdp_rx`, XDP on `rx_iface`): parses Ethernet/IPv4/UDP and
-//!   stores the receipt timestamp in TIMESTAMP_MAP, keyed on the tag. Runs
-//!   before routing and netfilter (pre-NAT).
-//! - TX (`iflat_tc_tx`, TC clsact egress on `tx_iface`): parses IPv4/UDP (a
-//!   tun device has no L2 header) and looks up the tag; on a match it removes
-//!   the record and adds the latency (now - stored) to the cumulative
-//!   LATENCY_SUM/LATENCY_COUNT accumulators. Runs after POSTROUTING
-//!   (post-NAT), before the egress qdisc.
+//! - RX (`iflat_xdp_rx`, XDP on `rx_iface`): parses Ethernet/IPv4 + UDP/TCP
+//!   and stores the receipt timestamp in TIMESTAMP_MAP, keyed on the tag.
+//!   Runs before routing and netfilter (pre-NAT).
+//! - TX (`iflat_tc_tx`, TC clsact egress on `tx_iface`): parses IPv4 +
+//!   UDP/TCP (a tun device has no L2 header) and looks up the tag; on a
+//!   match it removes the record and adds the latency (now - stored) to the
+//!   cumulative LATENCY_SUM/LATENCY_COUNT accumulators. Runs after
+//!   POSTROUTING (post-NAT), before the egress qdisc.
 //!
 //! # Moving Average
 //!

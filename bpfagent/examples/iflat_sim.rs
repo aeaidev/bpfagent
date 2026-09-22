@@ -1,7 +1,7 @@
 //! IFLAT system simulator — end-to-end test rig for the bpfagent IFLAT eBPF
 //! program. It builds a self-contained copy of the production data flow
 //!
-//!   sender --(UDP)--> RX iface --(route + nftables masquerade)--> tun0
+//!   sender --(UDP/TCP)--> RX iface --(route + nftables masquerade)--> tun0
 //!
 //! on one machine and measures the latency twice, independently:
 //! - in userspace: each datagram carries its send timestamp (CLOCK_MONOTONIC)
@@ -16,6 +16,12 @@
 //! connected by a veth pair and re-executes itself inside it. The host end
 //! of the pair (veth-iflat0) plays the role of the production RX interface
 //! (eno1); nftables masquerade towards tun0 mirrors /etc/nftables.conf.
+//!
+//! The sender alternates one UDP datagram and one TCP segment per cycle.
+//! Nothing at the destination answers, so TCP cannot go through a real
+//! connection: the segments are crafted statelessly on a raw socket (SYN
+//! with payload, fresh source port per segment, proper checksum) so
+//! conntrack accepts and masquerades them without any handshake.
 //!
 //! Usage (requires root; iproute2 and nftables must be installed):
 //!   sudo ./target/debug/examples/iflat_sim [NETEM_DELAY_MS]
@@ -51,6 +57,14 @@ const DEST: &str = "10.200.0.2:5000";
 /// 224.0.0.0/24) is also routed out tun0 and must be ignored.
 const DEST_IP: [u8; 4] = [10, 200, 0, 2];
 const DEST_PORT: u16 = 5000;
+/// Destination port of the crafted TCP segments (UDP uses DEST_PORT); also
+/// used as the receiver-side filter.
+const TCP_DEST_PORT: u16 = 5001;
+/// Sender address inside the namespace as octets (for crafting IP packets).
+const VETH_NS_IP_OCTETS: [u8; 4] = [192, 168, 100, 2];
+/// IP protocol numbers used when parsing/crafting packets.
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_TCP: u8 = 6;
 /// nftables table holding the masquerade rule; deleted whole on teardown.
 const NFT_TABLE: &str = "iflat-sim";
 
@@ -280,22 +294,147 @@ fn spawn_sender() -> Child {
     }
 }
 
-/// Sender role (runs inside the namespace): one UDP datagram every
-/// SEND_INTERVAL, each carrying a random 4-byte tag (the agent's correlation
-/// key) and its CLOCK_MONOTONIC send timestamp (the simulator's key).
+/// Accumulate 16-bit big-endian words of `data` into the running one's
+/// complement sum (a trailing odd byte counts as its high half).
+fn add_checksum_words(sum: &mut u32, data: &[u8]) {
+    let mut chunks = data.chunks_exact(2);
+    for w in &mut chunks {
+        *sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    }
+    if let [b] = chunks.remainder() {
+        *sum += u32::from(*b) << 8;
+    }
+}
+
+/// TCP checksum (RFC 793): one's complement of the one's-complement sum over
+/// the pseudo-header (src, dst, protocol, TCP length) and the TCP segment.
+/// Computed properly so conntrack accepts the crafted segments; NAT adjusts
+/// it incrementally when masquerading.
+fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    add_checksum_words(&mut sum, &src_ip);
+    add_checksum_words(&mut sum, &dst_ip);
+    sum += u32::from(IPPROTO_TCP);
+    sum += segment.len() as u32;
+    add_checksum_words(&mut sum, segment);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build one crafted TCP segment (IPv4 + TCP + payload) in `pkt`, returning
+/// its length: SYN flag, random ephemeral source port and sequence number,
+/// payload carrying the 4-byte tag and the 8-byte send timestamp in the same
+/// layout as the UDP datagrams.
+///
+/// A fresh source port per segment makes every segment a brand-new
+/// connection for conntrack, so no handshake or window tracking is needed
+/// (nothing at the destination answers); a SYN with payload is legal and
+/// passes conntrack's checks, so masquerade applies.
+fn craft_tcp_segment(pkt: &mut [u8], tag: u32, sent_ns: u64) -> usize {
+    const IP_HLEN: usize = 20;
+    const TCP_HLEN: usize = 20;
+    let total = IP_HLEN + TCP_HLEN + MSG_SIZE;
+
+    // IPv4 header; the kernel fills the header checksum (IP_HDRINCL).
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[1] = 0; // TOS
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[4..6].copy_from_slice(&0u16.to_be_bytes()); // ID
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    pkt[8] = 64; // TTL
+    pkt[9] = IPPROTO_TCP;
+    pkt[10..12].copy_from_slice(&0u16.to_be_bytes()); // header checksum
+    pkt[12..16].copy_from_slice(&VETH_NS_IP_OCTETS);
+    pkt[16..20].copy_from_slice(&DEST_IP);
+
+    // TCP header.
+    let tcp = IP_HLEN;
+    let sport = rand::random::<u16>() | 0x4000; // ephemeral
+    pkt[tcp..tcp + 2].copy_from_slice(&sport.to_be_bytes());
+    pkt[tcp + 2..tcp + 4].copy_from_slice(&TCP_DEST_PORT.to_be_bytes());
+    pkt[tcp + 4..tcp + 8].copy_from_slice(&rand::random::<u32>().to_be_bytes()); // seq
+    pkt[tcp + 8..tcp + 12].copy_from_slice(&0u32.to_be_bytes()); // ack_seq
+    pkt[tcp + 12] = ((TCP_HLEN / 4) as u8) << 4; // data offset
+    pkt[tcp + 13] = 0x02; // SYN
+    pkt[tcp + 14..tcp + 16].copy_from_slice(&64240u16.to_be_bytes()); // window
+    pkt[tcp + 16..tcp + 18].copy_from_slice(&0u16.to_be_bytes()); // checksum
+    pkt[tcp + 18..tcp + 20].copy_from_slice(&0u16.to_be_bytes()); // urg ptr
+
+    // Payload: same tag + timestamp layout as the UDP datagrams.
+    let payload = tcp + TCP_HLEN;
+    pkt[payload..payload + 4].copy_from_slice(&tag.to_be_bytes());
+    pkt[payload + 4..payload + 12].copy_from_slice(&sent_ns.to_be_bytes());
+
+    let cksum = tcp_checksum(
+        VETH_NS_IP_OCTETS,
+        DEST_IP,
+        &pkt[tcp..tcp + TCP_HLEN + MSG_SIZE],
+    );
+    pkt[tcp + 16..tcp + 18].copy_from_slice(&cksum.to_be_bytes());
+
+    total
+}
+
+/// Sender role (runs inside the namespace): alternates one UDP datagram and
+/// one crafted TCP segment every SEND_INTERVAL, each carrying a random
+/// 4-byte tag (the agent's correlation key) and its CLOCK_MONOTONIC send
+/// timestamp (the simulator's key).
 fn run_sender() {
-    let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
+    let udp = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
-        Err(e) => fatal(&format!("sender bind failed: {}", e)),
+        Err(e) => fatal(&format!("sender UDP bind failed: {}", e)),
     };
+    // Raw socket for the crafted TCP segments (IP_HDRINCL is implied by
+    // IPPROTO_RAW): nothing at the destination answers, so real TCP
+    // connections cannot be used.
+    let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if raw_fd < 0 {
+        fatal(&format!(
+            "sender raw socket() failed (need root/CAP_NET_RAW): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let raw_dest = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes(DEST_IP).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+
     let mut cycle: u64 = 0;
     loop {
-        let mut buf = [0u8; MSG_SIZE];
         let tag = rand::random::<u32>();
-        buf[..4].copy_from_slice(&tag.to_be_bytes());
-        buf[4..12].copy_from_slice(&monotonic_ns().to_be_bytes());
-        if let Err(e) = sock.send_to(&buf, DEST) {
-            eprintln!("iflat_sim[sender]: send_to({}) failed: {}", DEST, e);
+        let sent_ns = monotonic_ns();
+        if cycle % 2 == 0 {
+            let mut buf = [0u8; MSG_SIZE];
+            buf[..4].copy_from_slice(&tag.to_be_bytes());
+            buf[4..12].copy_from_slice(&sent_ns.to_be_bytes());
+            if let Err(e) = udp.send_to(&buf, DEST) {
+                eprintln!("iflat_sim[sender]: UDP send_to({}) failed: {}", DEST, e);
+            }
+        } else {
+            let mut pkt = [0u8; 128];
+            let len = craft_tcp_segment(&mut pkt, tag, sent_ns);
+            let sent = unsafe {
+                libc::sendto(
+                    raw_fd,
+                    pkt.as_ptr() as *const libc::c_void,
+                    len,
+                    0,
+                    &raw_dest as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                eprintln!(
+                    "iflat_sim[sender]: TCP sendto failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
         cycle += 1;
         if cycle.is_multiple_of(10) {
@@ -305,31 +444,41 @@ fn run_sender() {
     }
 }
 
-/// Extract (tag, send timestamp) from a raw IP packet read off the tun fd.
-/// Returns None for anything that is not one of our test datagrams: foreign
-/// UDP traffic also leaves via tun0 (the host's mDNS/LLMNR announcements
-/// appear as soon as the interface comes up), so check the destination
-/// address and port before trusting the payload layout.
-fn parse_packet(pkt: &[u8]) -> Option<(u32, u64)> {
+/// Extract (tag, send timestamp, protocol name) from a raw IP packet read
+/// off the tun fd. Returns None for anything that is not one of our test
+/// datagrams: foreign UDP traffic also leaves via tun0 (the host's
+/// mDNS/LLMNR announcements appear as soon as the interface comes up), so
+/// check the destination address and port before trusting the payload
+/// layout.
+fn parse_packet(pkt: &[u8]) -> Option<(u32, u64, &'static str)> {
     let version_ihl = *pkt.first()?;
     if version_ihl >> 4 != 4 {
         return None;
     }
     let ihl = usize::from(version_ihl & 0x0f) * 4;
-    if ihl < 20 || pkt.get(9) != Some(&17) {
-        return None; // IPv4 + UDP only
+    if ihl < 20 {
+        return None;
     }
     if pkt.get(16..20)? != DEST_IP {
         return None;
     }
+    let protocol = *pkt.get(9)?;
     let dport = u16::from_be_bytes(pkt.get(ihl + 2..ihl + 4)?.try_into().ok()?);
-    if dport != DEST_PORT {
-        return None;
-    }
-    let payload = pkt.get(ihl + 8..)?;
+    let (l4_hlen, name) = match protocol {
+        IPPROTO_UDP if dport == DEST_PORT => (8, "udp"),
+        IPPROTO_TCP if dport == TCP_DEST_PORT => {
+            let hlen = usize::from(pkt.get(ihl + 12)? >> 4) * 4;
+            if hlen < 20 {
+                return None;
+            }
+            (hlen, "tcp")
+        }
+        _ => return None,
+    };
+    let payload = pkt.get(ihl + l4_hlen..)?;
     let tag = u32::from_be_bytes(payload.get(0..4)?.try_into().ok()?);
     let ts = u64::from_be_bytes(payload.get(4..12)?.try_into().ok()?);
-    Some((tag, ts))
+    Some((tag, ts, name))
 }
 
 /// Receiver role: read forwarded datagrams from the tun fd and report the
@@ -351,7 +500,7 @@ fn run_receiver(tun_fd: RawFd) {
         if n <= 0 {
             continue;
         }
-        let Some((tag, sent_ns)) = parse_packet(&buf[..n as usize]) else {
+        let Some((tag, sent_ns, proto)) = parse_packet(&buf[..n as usize]) else {
             continue; // not a test datagram (foreign traffic on tun0), skip
         };
         let latency_us = monotonic_ns().saturating_sub(sent_ns) / 1_000;
@@ -360,7 +509,8 @@ fn run_receiver(tun_fd: RawFd) {
         min_us = min_us.min(latency_us);
         max_us = max_us.max(latency_us);
         eprintln!(
-            "iflat_sim[recv]: tag=0x{:08x} userspace latency={} us (avg={} us, min={} us, max={} us, {} samples)",
+            "iflat_sim[recv]: {} tag=0x{:08x} userspace latency={} us (avg={} us, min={} us, max={} us, {} samples)",
+            proto,
             tag,
             latency_us,
             sum_us / samples,
@@ -404,12 +554,12 @@ fn main() {
     setup(netem_delay_ms);
 
     eprintln!(
-        "iflat_sim: sender in netns '{}' sends UDP to {} every {:?}; datagrams arrive on {},",
-        NETNS, DEST, SEND_INTERVAL, VETH_HOST
+        "iflat_sim: sender in netns '{}' alternates UDP to {} and crafted TCP to 10.200.0.2:{} every {:?};",
+        NETNS, DEST, TCP_DEST_PORT, SEND_INTERVAL
     );
     eprintln!(
-        "iflat_sim: get NATed towards tun0 ({}) and are read back from the tun fd",
-        TUN_IP
+        "iflat_sim: datagrams arrive on {}, get NATed towards tun0 ({}) and are read back from the tun fd",
+        VETH_HOST, TUN_IP
     );
     if netem_delay_ms > 0 {
         eprintln!(
