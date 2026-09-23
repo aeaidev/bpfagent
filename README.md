@@ -7,6 +7,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - **IRSS** - measures UDP-to-raw-IP forwarding latency
 - **IFLAT** - measures interface-to-interface forwarding latency (e.g. eno1 → tun0) across NAT
 - **uprobe** - traces userspace function calls and their arguments
+- **my_program** - the [Plugin Development Guide](docs/PLUGINS.md) worked example (per-PID openat counter), disabled by default
 
 ## Quick Links
 
@@ -182,6 +183,9 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - Counts calls per process; snapshots up to 6 argument registers of the most recent call
   - Optional C-string read of one argument; attach configured via `[ebpf_programs.settings]` (`target`, `symbol`, `offset`, `pid`, `string_arg`)
   - Exports the `uprobe_calls_total{pname}` counter via Prometheus
+- **my_program** - example plugin from the [Plugin Development Guide](docs/PLUGINS.md)
+  - Counts `sys_enter_openat` calls per PID; a live reference implementation for new plugins
+  - Exports the `my_program_events_per_pid{pid}` gauge via Prometheus; disabled by default
 - **Prometheus metrics exporter** - exposes metrics via HTTP endpoint for monitoring
 - **Configurable metrics server** - customize IP address and port via command-line options
 - **Clean code organization** - separates concerns into modules (common, config, programs, metrics)

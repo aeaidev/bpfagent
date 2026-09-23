@@ -35,6 +35,12 @@ enabled = false
 # tx_iface = "tun0"   # egress interface (TC clsact egress)
 
 [[ebpf_programs]]
+name = "my_program"
+enabled = false
+# Example plugin from docs/PLUGINS.md: counts openat() calls per PID and
+# exports the my_program_events_per_pid gauge. No settings.
+
+[[ebpf_programs]]
 name = "uprobe"
 enabled = false
 # Traces calls + arguments of a userspace function; target and symbol are

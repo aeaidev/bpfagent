@@ -2,11 +2,13 @@
 /*
  * Template: eBPF kernel program in C for bpfagent (see docs/PLUGINS_C.md)
  *
- * This is the C counterpart of the Rust eBPF template in docs/PLUGINS.md.
+ * This is the C counterpart of the Rust eBPF template
+ * docs/templates/custom_program_ebpf.rs (see docs/PLUGINS.md).
  * To use it:
  * 1. Copy this file to ebpf/my_program/my_program.c — bpfagent/build.rs
- *    discovers ebpf/*\/*.c automatically and compiles it with clang into
- *    OUT_DIR on every cargo build (see docs/PLUGINS_C.md, step 3)
+ *    automatically discovers every .c file in the ebpf/ plugin directories
+ *    and compiles it with clang into OUT_DIR on every cargo build (see
+ *    docs/PLUGINS_C.md, step 3)
  * 2. Write the userspace handler in Rust exactly as in docs/PLUGINS.md —
  *    aya loads the clang-produced object identically to a Rust-produced one
  *    (a complete example: docs/templates/custom.rs)

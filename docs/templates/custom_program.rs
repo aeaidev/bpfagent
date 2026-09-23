@@ -1,28 +1,41 @@
-//! Example: Creating a Custom eBPF Program
+//! Skeleton: userspace module for a custom eBPF program
 //!
-//! This is a template that shows how to create a new eBPF program plugin.
-//! To use this:
-//! 1. Copy this file to a new module in bpfagent/src/programs/
-//! 2. Create a corresponding eBPF program in ebpf/
-//! 3. Implement the EbpfProgram trait as shown
-//! 4. Register it in register_programs() in bpfagent/src/app.rs by adding:
-//!    `crate::programs::your_program::init(&mut registry);`
+//! This is a skeleton showing the structure every userspace handler follows.
+//! For a complete, compilable example (with metrics) see
+//! docs/templates/custom.rs; for the matching eBPF kernel programs see
+//! docs/templates/custom_program_ebpf.rs (Rust) and
+//! docs/templates/custom_program.c (C).
+//!
+//! To use this (full walkthrough: docs/PLUGINS.md):
+//! 1. Copy this file to a new module in bpfagent/src/programs/<name>/mod.rs
+//! 2. Create the corresponding eBPF crate in ebpf/<name>/ and shared-types
+//!    crate in common/<name>/
+//! 3. Implement the EbpfProgram trait as shown below
+//! 4. Add `pub mod <name>;` to bpfagent/src/programs/mod.rs
+//! 5. Register it in register_programs() in bpfagent/src/app.rs by adding:
+//!    `crate::programs::<name>::init(&mut registry);`
+//! 6. Wire up the build:
+//!    - add "common/<name>" and "ebpf/<name>" to workspace `members` in the
+//!      root Cargo.toml, and "common/<name>" to `default-members` (never the
+//!      eBPF crate — it only builds for the BPF target)
+//!    - add `<name>-common = { path = "../common/<name>" }` to
+//!      [dependencies] in bpfagent/Cargo.toml
+//!    - add "<name>-ebpf" to the match in bpfagent/build.rs
+//! 7. Add a [[ebpf_programs]] entry to the config
 //!
 //! # Structure
 //!
 //! A typical program consists of:
 //! - A struct implementing the EbpfProgram trait plus its mandatory
 //!   EbpfAccess supertrait (both defined in programs/traits.rs)
-//! - Load: Initialization from bytecode
-//! - Start: Attaching to kernel hooks
-//! - Optional: Metrics display for Prometheus
-//!
-//! # Example: Simple Tracepoint Program
-//!
-//! This shows a minimal program that traces a kernel tracepoint.
+//! - load(): load the bytecode, get programs/maps, load + attach them
+//! - start(): log that the program is running (attach already happened in
+//!   load(); see programs/kfree_skb/mod.rs)
+//! - Optional: MetricsDisplay for Prometheus export
+
+use std::any::Any;
 
 use aya::Ebpf;
-use std::any::Any;
 
 // The real traits live in programs/traits.rs and are re-exported here;
 // do not redefine them locally.
@@ -67,13 +80,13 @@ impl EbpfAccess for ExampleProgram {
 /// # Implementing the EbpfProgram Trait
 ///
 /// The load() method should:
-/// - Load the compiled eBPF bytecode
-/// - Get references to programs and maps
-/// - Perform initialization
+/// - Load the compiled eBPF bytecode via Ebpf::load()
+/// - Get references to the eBPF programs and maps
+/// - Call program.load() and program.attach(...) for each program
+/// - Perform any initial setup (e.g., populate config BPF maps)
 ///
-/// The start() method should:
-/// - Attach the eBPF program to kernel hooks
-/// - This might be tracepoints, kprobes, or other attachment points
+/// The start() method is called after all programs are loaded; existing
+/// programs only log there, since attach already happened in load().
 ///
 /// If the program exports Prometheus metrics, also implement MetricsDisplay
 /// and override supports_metrics() and as_metrics_mut() to return
@@ -87,29 +100,33 @@ impl EbpfProgram for ExampleProgram {
 
     fn load(&mut self) -> Result<(), anyhow::Error> {
         // Example: Load eBPF program from compiled bytecode
-        // let ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
+        // let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         //     env!("OUT_DIR"),
         //     "/example"
         // )))?;
+        //
+        // // Get the program, load it into the kernel, and attach it.
+        // // The aya program name is the eBPF *function* name.
+        // let program: &mut aya::programs::TracePoint = ebpf
+        //     .program_mut("example")
+        //     .ok_or_else(|| anyhow::anyhow!("program not found"))?
+        //     .try_into()?;
+        // program.load()?;
+        // program.attach("category", "event")?;
+        //
         // self.ebpf = Some(ebpf);
         // Ok(())
 
         // Placeholder for demonstration
-        unimplemented!("Implement loading of your eBPF program bytecode")
+        unimplemented!("Implement loading and attaching of your eBPF program")
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
-        // Example: Attach to a tracepoint
-        // if let Some(ebpf) = &mut self.ebpf {
-        //     let program: &mut TracePoint = ebpf.program_mut("trace_example")
-        //         .ok_or_else(|| anyhow::anyhow!("program not found"))?
-        //         .try_into()?;
-        //     program.load()?;
-        //     program.attach("category", "event")?;
-        // }
+        // Attach already happened in load(); just log.
+        // log::info!("ExampleProgram started");
         // Ok(())
 
-        unimplemented!("Implement attaching your eBPF program to kernel hooks")
+        unimplemented!("Implement any post-load startup logic (usually just a log line)")
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

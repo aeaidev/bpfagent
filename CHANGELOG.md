@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved from an unfiltered `sys_enter_recvmsg` tracepoint to a kprobe on
   `udp_recvmsg` that checks the socket's local port (`LISTEN_PORT_MAP`), so
   unrelated receive traffic is filtered out too
+- `my_program` example plugin: the docs/PLUGINS.md worked example shipped as
+  a live reference implementation (`ebpf/my_program`, `common/my_program`,
+  `bpfagent/src/programs/my_program`). Counts `sys_enter_openat` calls per
+  PID and exports the `my_program_events_per_pid` gauge; disabled by default
 - IFLAT eBPF program: measures interface-to-interface forwarding latency of
   UDP datagrams (e.g. eno1 -> tun0) across nftables NAT. RX is an XDP program
   on the ingress interface, TX a TC clsact egress classifier on the egress
@@ -102,6 +106,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer confused) and every discovered PID is translated to the host PID
   namespace via the NSpid field of /proc/<pid>/status, which is what
   bpf_get_current_pid_tgid() reports to the eBPF program
+- docs/PLUGINS.md rewritten against a plugin (per-PID openat counter) that was
+  actually built and run: the eBPF template now includes the required
+  #[panic_handler] and license section, the broken raw `ctx.as_ptr()` counter
+  example was replaced with bpf_get_current_pid_tgid(), the userspace handler
+  gained the init() function that register_programs() calls, and the build
+  wiring now covers the workspace members/default-members entries, the
+  <name>-common dependency in bpfagent/Cargo.toml, and the bpfagent/build.rs
+  match. docs/templates gained a copy-ready Rust eBPF kernel template
+  (custom_program_ebpf.rs); custom.rs was synced with the verified handler and
+  custom_program.c now compiles without warnings
 
 ## [0.1.0] - 2026-08-07
 

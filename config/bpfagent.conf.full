@@ -62,6 +62,12 @@ rx_iface = "eno1"
 tx_iface = "tun0"
 
 [[ebpf_programs]]
+name = "my_program"
+enabled = false
+# Example plugin from docs/PLUGINS.md: counts openat() calls per PID and
+# exports the my_program_events_per_pid gauge. No settings.
+
+[[ebpf_programs]]
 name = "uprobe"
 enabled = false
 # Traces calls to a function in a userspace binary/shared library and

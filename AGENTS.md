@@ -12,7 +12,8 @@ Linux, loads multiple eBPF programs into the kernel, periodically reads their
 BPF maps, and exposes the collected data as Prometheus metrics over HTTP
 (default `0.0.0.0:9101/metrics`).
 
-Five eBPF programs ship with the agent:
+Five eBPF programs ship with the agent, plus the `my_program` example plugin
+(the `docs/PLUGINS.md` worked example, disabled by default):
 
 - **kfree_skb** — counts kernel packet drops by reason at the `skb:kfree_skb`
   tracepoint (kernel `enum skb_drop_reason`).
@@ -32,13 +33,17 @@ Five eBPF programs ship with the agent:
   library and snapshots its arguments (up to 6 register values, x86_64 SysV
   ABI); the attach target is runtime-configurable (`target`, `symbol`,
   `offset`, `pid`, `string_arg`).
+- **my_program** — the worked example plugin from `docs/PLUGINS.md`, kept in
+  the tree as a live reference implementation: counts `sys_enter_openat`
+  calls per PID and exports the `my_program_events_per_pid` gauge. Disabled
+  by default; safe starting point for new plugins.
 
 License: MIT OR Apache-2.0. Rust edition 2021. All documentation and code
 comments are in English.
 
 ## Repository Layout
 
-Cargo workspace (root `Cargo.toml`) with 9 members. Each eBPF program follows a
+Cargo workspace (root `Cargo.toml`) with 13 members. Each eBPF program follows a
 strict three-crate pattern:
 
 ```
@@ -58,7 +63,8 @@ bpfagent/               # Userspace application (lib + thin `bpfagent` binary)
 │       ├── kfree_skb/mod.rs
 │       ├── sca/mod.rs      # SCA handler (metrics, display, hop discovery)
 │       ├── iflat/mod.rs    # IFLAT handler (metrics, display, XDP/TC attach)
-│       └── uprobe/mod.rs   # uprobe handler (metrics, display, attach config)
+│       ├── uprobe/mod.rs   # uprobe handler (metrics, display, attach config)
+│       └── my_program/mod.rs # example plugin from docs/PLUGINS.md
 ├── examples/
 │   ├── irss_sim.rs     # IRSS data-flow simulator for end-to-end testing
 │   ├── sca_sim.rs      # SCA pipeline simulator (6 processes, 7 hops)
@@ -69,7 +75,8 @@ bpfagent/               # Userspace application (lib + thin `bpfagent` binary)
 └── Cargo.toml          # Also holds [package.metadata.deb] for cargo-deb
 
 common/<name>/          # Shared types between kernel and userspace
-                        # (iflat, irss, kfree_skb, sca, uprobe; no_std-compatible,
+                        # (iflat, irss, kfree_skb, my_program, sca, uprobe;
+                        #  no_std-compatible,
                         #  optional `user` feature pulls in aya for userspace)
 ebpf/<name>/            # eBPF kernel program source (#![no_std] #![no_main],
                         # compiled to bpfel-unknown-none)
@@ -84,14 +91,15 @@ scripts/                # setup.sh, build.sh, test.sh, lint.sh, format.sh, relea
 bpfagent.conf           # Development config (current dir is a search path)
 ```
 
-The workspace `default-members` are `bpfagent` + the five `common/*` crates;
+The workspace `default-members` are `bpfagent` + the six `common/*` crates;
 the `ebpf/*` crates are workspace members but are built for the BPF target by
 `bpfagent/build.rs`, not by a plain `cargo build`.
 
 ## Build System Details
 
 - `bpfagent/build.rs` discovers the `iflat-ebpf`, `irss-ebpf`, `kfree_skb-ebpf`,
-  `sca-ebpf`, and `uprobe-ebpf` packages from workspace metadata and compiles
+  `my_program-ebpf`, `sca-ebpf`, and `uprobe-ebpf` packages from workspace
+  metadata and compiles
   them with `aya-build` (nightly toolchain + `bpf-linker` to
   `bpfel-unknown-none`). The
   objects land in `OUT_DIR` under their `[[bin]]` names and are embedded into
@@ -225,8 +233,11 @@ copy-ready templates in `docs/templates/`. Checklist:
 4. `pub mod <name>;` in `bpfagent/src/programs/mod.rs`.
 5. `crate::programs::<name>::init(&mut registry);` in `register_programs()`
    in `bpfagent/src/app.rs`.
-6. Add `"ebpf/<name>"` to workspace `members` in the root `Cargo.toml` and the
-   package name to the match in `bpfagent/build.rs`.
+6. Add `"ebpf/<name>"` and `"common/<name>"` to workspace `members` in the
+   root `Cargo.toml` (only `"common/<name>"` also goes into
+   `default-members`), the eBPF package name to the match in
+   `bpfagent/build.rs`, and `<name>-common = { path = "../common/<name>" }`
+   to `[dependencies]` in `bpfagent/Cargo.toml`.
 7. Optional per-program settings: override `EbpfProgram::configure()` and read
    the `[ebpf_programs.settings]` TOML table; pass runtime values to the eBPF
    side through a small config map written in `load()` before attaching

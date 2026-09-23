@@ -3,6 +3,7 @@
 pub mod iflat;
 pub mod irss;
 pub mod kfree_skb;
+pub mod my_program;
 pub mod registry;
 pub mod sca;
 pub mod traits;
