@@ -6,6 +6,7 @@ A generic eBPF agent application that manages multiple eBPF programs and exposes
 - **SCA** - traces socket communication latency per process
 - **IRSS** - measures UDP-to-raw-IP forwarding latency
 - **IFLAT** - measures interface-to-interface forwarding latency (e.g. eno1 → tun0) across NAT
+- **IFLAT_UPROBE** - measures a datagram's latency from interface ingress to interface ingress and on to a userspace function call
 - **uprobe** - traces userspace function calls and their arguments
 - **my_program** - the [Plugin Development Guide](docs/PLUGINS.md) worked example (per-PID openat counter), disabled by default
 
@@ -64,6 +65,17 @@ The IFLAT program measures how long the kernel holds one UDP, TCP or ICMP-echo d
 3. Userspace turns the cumulative accumulators into a periodic moving average exported via Prometheus (`iflat_avg_latency_us`)
 
 Both interfaces are required settings (`rx_iface`, `tx_iface`) — without them the program stays disabled. Tested end-to-end with the `iflat_sim` example, which builds a netns+veth+tun topology with nftables masquerade and reports the userspace send-to-receive latency for comparison.
+
+### IFLAT_UPROBE Program
+
+The IFLAT_UPROBE program measures a pair of latencies for one UDP or TCP datagram on its way from a physical interface into a userspace application function — e.g. `void FpgaPciePhy::submitBurst(Endpoint from, TxSlot &slot)` — see [IFLAT_UPROBE](docs/IFLAT_UPROBE.md):
+
+1. On ingress on the first interface (XDP on `rx1_iface`, e.g. `eno1`): stores the receipt timestamp keyed by the first 4 payload bytes (big-endian tag)
+2. On ingress on the second interface (XDP on `rx2_iface`, e.g. `tun0`): looks up the tag; on a match it removes the record and accumulates the RX1→RX2 latency, then stores its own timestamp under the tag
+3. On every call of the configured function (uprobe): rebuilds the tag from the payload passed as a parameter; on a match it removes the record and accumulates the RX2→function-call latency
+4. Userspace turns both cumulative accumulators into periodic moving averages exported via Prometheus (`iflat_uprobe_avg_latency1_us`, `iflat_uprobe_avg_latency2_us`)
+
+The interfaces and the attach target are required settings (`rx1_iface`, `rx2_iface`, `target`, `symbol`) — without them the program stays disabled. How the payload address is found from the function arguments is configurable (`arg_index`, `payload_ptr_offset`, `tag_offset`; the last two locate the tag through e.g. the `payload` member of a `TxSlot` struct). Tested end-to-end with the `iflat_uprobe_sim` example, which drives the full path (netns sender → veth ingress → tun re-injection → instrumented function call) and prints the userspace latency spans for comparison.
 
 ### uprobe Program
 
@@ -178,6 +190,12 @@ Use the `-f/--config-file` option to specify a custom config file path.
   - On egress (TC clsact egress on `tx_iface`): matches the key, removes it, accumulates latency
   - Interfaces configured via `[ebpf_programs.settings]` (`rx_iface`, `tx_iface`; required)
   - Exports a per-interval moving average (`iflat_avg_latency_us`) via Prometheus
+- **IFLAT_UPROBE program** - measures a datagram's latency from interface ingress to interface ingress to a userspace function call
+  - On ingress (XDP on `rx1_iface`): stores timestamp keyed by the first 4 payload bytes
+  - On ingress (XDP on `rx2_iface`): matches the key, removes it, accumulates the RX1→RX2 latency, stores its own timestamp
+  - On the configured function call (uprobe): rebuilds the tag from the payload argument, matches it, accumulates the RX2→call latency
+  - Attach point configured via `[ebpf_programs.settings]` (`rx1_iface`, `rx2_iface`, `target`, `symbol`; required, plus `offset`, `pid`, `arg_index`, `payload_ptr_offset`, `tag_offset`)
+  - Exports per-interval moving averages (`iflat_uprobe_avg_latency1_us`, `iflat_uprobe_avg_latency2_us`) via Prometheus
 - **uprobe program** - traces userspace function calls and their arguments
   - Attaches a uprobe to a function symbol in a binary or shared library
   - Counts calls per process; snapshots up to 6 argument registers of the most recent call
@@ -404,6 +422,13 @@ scrape_configs:
 |--------|------|--------|-------------|
 | `iflat_avg_latency_us` | Gauge | | Average interface-to-interface forwarding latency in microseconds (per-interval moving average; 0 when no traffic) |
 
+#### IFLAT_UPROBE Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `iflat_uprobe_avg_latency1_us` | Gauge | | Average RX1-to-RX2 interface ingress latency in microseconds (per-interval moving average; 0 when no traffic) |
+| `iflat_uprobe_avg_latency2_us` | Gauge | | Average RX2-to-function-call latency in microseconds (per-interval moving average; 0 when no traffic) |
+
 #### uprobe Metrics
 
 | Metric | Type | Labels | Description |
@@ -527,6 +552,7 @@ bpfagent/
 │   └── examples/
 │       ├── irss_sim.rs # IRSS data-flow simulator for end-to-end testing
 │       ├── sca_sim.rs  # SCA pipeline simulator for end-to-end testing
+│       ├── iflat_uprobe_sim.rs # IFLAT_UPROBE end-to-end simulator (root)
 │       └── uprobe_sim.rs # uprobe test target for end-to-end testing
 ├── common/
 │   ├── irss/           # Shared types between user and eBPF code

@@ -73,6 +73,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `uprobe_calls_total{pname}` counter
 - uprobe simulator example (`bpfagent/examples/uprobe_sim.rs`) for
   end-to-end testing
+- IFLAT_UPROBE eBPF program (docs/IFLAT_UPROBE.md): measures a pair of
+  latencies for one UDP/TCP datagram — 1) ingress on `rx1_iface` (XDP) to
+  ingress on `rx2_iface` (XDP), 2) ingress on `rx2_iface` to the call of a
+  function receiving the payload as a parameter (uprobe, e.g.
+  `FpgaPciePhy::submitBurst`). Datagrams are correlated by the first 4
+  payload bytes; the uprobe resolves the payload address from the configured
+  argument register, chasing the payload-pointer member of the argument
+  struct when needed (`arg_index`, `payload_ptr_offset` — e.g.
+  offsetof(TxSlot, payload) — and `tag_offset`, written to
+  `UPROBE_CONFIG_MAP` at load time). The interfaces and the attach target
+  are required settings
+  (`rx1_iface`, `rx2_iface`, `target`, `symbol`; plus `offset`, `pid`);
+  without them the program stays disabled. Per-interval moving averages are
+  exported as the `iflat_uprobe_avg_latency1_us` and
+  `iflat_uprobe_avg_latency2_us` gauges
+- IFLAT_UPROBE simulator example (`bpfagent/examples/iflat_uprobe_sim.rs`)
+  for end-to-end testing: a netns sender drives UDP datagrams across a veth
+  pair (RX1), the sim re-injects them into tun0 (RX2) and calls the
+  exported `iflat_uprobe_sim_submit()` with the payload in a TxSlot-
+  mirroring struct (payload pointer at offset 296, checked at compile
+  time), printing the userspace per-leg spans for comparison
 
 ### Changed
 - Improved code organization with logical modules

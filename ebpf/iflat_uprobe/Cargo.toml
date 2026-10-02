@@ -1,0 +1,17 @@
+[package]
+name = "iflat_uprobe-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+iflat_uprobe-common = { path = "../../common/iflat_uprobe" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "iflat_uprobe"
+path = "src/main.rs"

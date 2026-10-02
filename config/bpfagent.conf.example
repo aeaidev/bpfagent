@@ -35,6 +35,30 @@ enabled = false
 # tx_iface = "tun0"   # egress interface (TC clsact egress)
 
 [[ebpf_programs]]
+name = "iflat_uprobe"
+enabled = false
+# Measures a pair of latencies for one UDP/TCP datagram: 1) ingress on
+# rx1_iface -> ingress on rx2_iface, 2) ingress on rx2_iface -> the call of a
+# function receiving the payload (docs/IFLAT_UPROBE.md). Correlates the first
+# 4 payload bytes. Required settings (no defaults; the program stays disabled
+# without them):
+# [ebpf_programs.settings]
+# rx1_iface = "eno1"        # first ingress interface (XDP)
+# rx2_iface = "tun0"        # second ingress interface (XDP)
+# target = "/path/to/app"   # binary or shared library to instrument
+# symbol = "function_name"  # function receiving the payload (ELF symbol)
+# offset = 0                # extra byte offset past the symbol
+# pid = -1                  # -1 = all processes, or a specific PID
+# arg_index = 3             # SysV argument register leading to the payload
+#                           # (C++ method: 1 = this, 2 = first arg)
+# payload_ptr_offset = -1   # offset of the payload pointer within the
+#                           # pointed-to struct (e.g. offsetof(TxSlot,
+#                           # payload) = 296); -1 = the argument points
+#                           # directly at the payload
+# tag_offset = 0            # byte offset from the resolved payload pointer
+#                           # to the first payload byte
+
+[[ebpf_programs]]
 name = "my_program"
 enabled = false
 # Example plugin from docs/PLUGINS.md: counts openat() calls per PID and

@@ -12,7 +12,7 @@ Linux, loads multiple eBPF programs into the kernel, periodically reads their
 BPF maps, and exposes the collected data as Prometheus metrics over HTTP
 (default `0.0.0.0:9101/metrics`).
 
-Five eBPF programs ship with the agent, plus the `my_program` example plugin
+Six eBPF programs ship with the agent, plus the `my_program` example plugin
 (the `docs/PLUGINS.md` worked example, disabled by default):
 
 - **kfree_skb** — counts kernel packet drops by reason at the `skb:kfree_skb`
@@ -29,6 +29,14 @@ Five eBPF programs ship with the agent, plus the `my_program` example plugin
   on the egress interface correlate datagrams by their first 4 payload
   bytes (which NAT does not rewrite); interfaces are required settings
   (`rx_iface`, `tx_iface`), without them the program stays disabled.
+- **iflat_uprobe** — measures a pair of latencies for one UDP/TCP datagram:
+  ingress on `rx1_iface` (XDP) → ingress on `rx2_iface` (XDP) → the call of
+  a function receiving the payload as a parameter (uprobe, e.g.
+  `FpgaPciePhy::submitBurst`); datagrams are correlated by their first 4
+  payload bytes, the uprobe tag location is runtime-configurable
+  (`arg_index`, `payload_ptr_offset`, `tag_offset`); interfaces and the
+  attach target are required
+  settings (`rx1_iface`, `rx2_iface`, `target`, `symbol`).
 - **uprobe** — traces calls to a function in a userspace binary/shared
   library and snapshots its arguments (up to 6 register values, x86_64 SysV
   ABI); the attach target is runtime-configurable (`target`, `symbol`,
@@ -43,7 +51,7 @@ comments are in English.
 
 ## Repository Layout
 
-Cargo workspace (root `Cargo.toml`) with 13 members. Each eBPF program follows a
+Cargo workspace (root `Cargo.toml`) with 15 members. Each eBPF program follows a
 strict three-crate pattern:
 
 ```
@@ -63,20 +71,23 @@ bpfagent/               # Userspace application (lib + thin `bpfagent` binary)
 │       ├── kfree_skb/mod.rs
 │       ├── sca/mod.rs      # SCA handler (metrics, display, hop discovery)
 │       ├── iflat/mod.rs    # IFLAT handler (metrics, display, XDP/TC attach)
+│       ├── iflat_uprobe/mod.rs # IFLAT_UPROBE handler (XDP x2 + uprobe attach)
 │       ├── uprobe/mod.rs   # uprobe handler (metrics, display, attach config)
 │       └── my_program/mod.rs # example plugin from docs/PLUGINS.md
 ├── examples/
 │   ├── irss_sim.rs     # IRSS data-flow simulator for end-to-end testing
 │   ├── sca_sim.rs      # SCA pipeline simulator (6 processes, 7 hops)
 │   ├── iflat_sim.rs    # IFLAT topology simulator (netns+veth+tun+NAT; root)
+│   ├── iflat_uprobe_sim.rs # IFLAT_UPROBE simulator (netns+veth+tun +
+│   │                     # TxSlot-mirroring uprobe target; root)
 │   └── uprobe_sim.rs   # uprobe test target (calls a known function in a loop)
 ├── tests/              # Integration tests (no root required)
 ├── build.rs            # Compiles all eBPF crates via aya-build (see below)
 └── Cargo.toml          # Also holds [package.metadata.deb] for cargo-deb
 
 common/<name>/          # Shared types between kernel and userspace
-                        # (iflat, irss, kfree_skb, my_program, sca, uprobe;
-                        #  no_std-compatible,
+                        # (iflat, iflat_uprobe, irss, kfree_skb, my_program,
+                        #  sca, uprobe; no_std-compatible,
                         #  optional `user` feature pulls in aya for userspace)
 ebpf/<name>/            # eBPF kernel program source (#![no_std] #![no_main],
                         # compiled to bpfel-unknown-none)
@@ -91,14 +102,15 @@ scripts/                # setup.sh, build.sh, test.sh, lint.sh, format.sh, relea
 bpfagent.conf           # Development config (current dir is a search path)
 ```
 
-The workspace `default-members` are `bpfagent` + the six `common/*` crates;
+The workspace `default-members` are `bpfagent` + the seven `common/*` crates;
 the `ebpf/*` crates are workspace members but are built for the BPF target by
 `bpfagent/build.rs`, not by a plain `cargo build`.
 
 ## Build System Details
 
-- `bpfagent/build.rs` discovers the `iflat-ebpf`, `irss-ebpf`, `kfree_skb-ebpf`,
-  `my_program-ebpf`, `sca-ebpf`, and `uprobe-ebpf` packages from workspace
+- `bpfagent/build.rs` discovers the `iflat-ebpf`, `iflat_uprobe-ebpf`,
+  `irss-ebpf`, `kfree_skb-ebpf`, `my_program-ebpf`, `sca-ebpf`, and
+  `uprobe-ebpf` packages from workspace
   metadata and compiles
   them with `aya-build` (nightly toolchain + `bpf-linker` to
   `bpfel-unknown-none`). The
@@ -288,7 +300,8 @@ Reference: `config/bpfagent.conf.full`.
 - `docs/ARCHITECTURE.md` — component design, traits, event loop, lifecycle
 - `docs/DEVELOPMENT.md` — build/test/debug workflows
 - `docs/PLUGINS.md` / `docs/PLUGINS_C.md` — plugin development (Rust / C)
-- `docs/IRSS.md`, `docs/SCA_DATA_FLOW.md`, `docs/IFLAT.md` — per-program data flows
+- `docs/IRSS.md`, `docs/SCA_DATA_FLOW.md`, `docs/IFLAT.md`,
+  `docs/IFLAT_UPROBE.md` — per-program data flows
 - `docs/UPROBE.md` — uprobe settings, symbol requirements, sim walkthrough
 - `docs/bpfagent.1` — man page (`man -l docs/bpfagent.1`)
 - `CHANGELOG.md` — version history (Keep a Changelog)

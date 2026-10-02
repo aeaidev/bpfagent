@@ -3,19 +3,21 @@ resolver = "2"
 members = [
     "bpfagent",
     "common/iflat",
+    "common/iflat_uprobe",
     "common/irss",
     "common/kfree_skb",
     "common/my_program",
     "common/sca",
     "common/uprobe",
     "ebpf/iflat",
+    "ebpf/iflat_uprobe",
     "ebpf/irss",
     "ebpf/kfree_skb",
     "ebpf/my_program",
     "ebpf/sca",
     "ebpf/uprobe",
 ]
-default-members = ["bpfagent", "common/iflat", "common/irss", "common/kfree_skb", "common/my_program", "common/sca", "common/uprobe"]
+default-members = ["bpfagent", "common/iflat", "common/iflat_uprobe", "common/irss", "common/kfree_skb", "common/my_program", "common/sca", "common/uprobe"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

@@ -24,6 +24,7 @@ fn register_programs() -> ProgramRegistry {
     // Initialize all program modules - each module registers itself
     // To add a new program, add its module and call its init function here
     crate::programs::iflat::init(&mut registry);
+    crate::programs::iflat_uprobe::init(&mut registry);
     crate::programs::irss::init(&mut registry);
     crate::programs::kfree_skb::init(&mut registry);
     crate::programs::my_program::init(&mut registry);

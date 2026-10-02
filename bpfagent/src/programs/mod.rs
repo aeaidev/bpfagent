@@ -1,6 +1,7 @@
 //! eBPF program management, registry, and traits
 
 pub mod iflat;
+pub mod iflat_uprobe;
 pub mod irss;
 pub mod kfree_skb;
 pub mod my_program;

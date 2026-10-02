@@ -27,6 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 prometheus = { workspace = true, default-features = false, features = ["process"] }
 iflat-common = { path = "../common/iflat" }
+iflat_uprobe-common = { path = "../common/iflat_uprobe", features = ["user"] }
 irss-common = { path = "../common/irss" }
 kfree_skb-common = { path = "../common/kfree_skb" }
 my_program-common = { path = "../common/my_program" }
